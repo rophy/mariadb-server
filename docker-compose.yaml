@@ -1,0 +1,27 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Mount source code
+      - .:/src:cached
+      # Persist build cache
+      - mariadb-build:/src/build
+      # Persist ccache
+      - mariadb-ccache:/ccache
+    working_dir: /src
+    # Keep container running
+    stdin_open: true
+    tty: true
+    # Use host network for easier testing
+    network_mode: host
+    # Allow debugging
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+
+volumes:
+  mariadb-build:
+  mariadb-ccache:
