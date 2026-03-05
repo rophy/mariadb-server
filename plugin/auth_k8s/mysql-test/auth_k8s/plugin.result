@@ -1,0 +1,15 @@
+SELECT PLUGIN_NAME, PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS
+WHERE PLUGIN_NAME = 'auth_k8s';
+PLUGIN_NAME	PLUGIN_STATUS
+auth_k8s	ACTIVE
+SHOW VARIABLES LIKE 'auth_k8s%';
+Variable_name	Value
+auth_k8s_api_url	https://kubernetes.default.svc
+auth_k8s_ca_path	/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+auth_k8s_timeout	10
+auth_k8s_token_path	/var/run/secrets/kubernetes.io/serviceaccount/token
+CREATE USER 'k8s_test_user' IDENTIFIED WITH auth_k8s;
+ERROR 28000: Access denied for user 'k8s_test_user'@'localhost' (using password: YES)
+ERROR 28000: Access denied for user 'k8s_test_user'@'localhost' (using password: YES)
+connection default;
+DROP USER 'k8s_test_user';

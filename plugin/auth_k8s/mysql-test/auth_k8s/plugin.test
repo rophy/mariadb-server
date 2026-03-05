@@ -1,0 +1,38 @@
+--source include/not_embedded.inc
+
+#
+# Verify plugin is loaded
+#
+SELECT PLUGIN_NAME, PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS
+  WHERE PLUGIN_NAME = 'auth_k8s';
+
+#
+# Verify system variables exist with defaults
+#
+SHOW VARIABLES LIKE 'auth_k8s%';
+
+#
+# Test: Empty password is rejected
+#
+CREATE USER 'k8s_test_user' IDENTIFIED WITH auth_k8s;
+
+--disable_query_log
+--replace_result $MASTER_MYSOCK MASTER_MYSOCK $MASTER_MYPORT MASTER_MYPORT
+--error ER_ACCESS_DENIED_ERROR
+--connect (con_empty, localhost, k8s_test_user,,,,,auth=mysql_clear_password:mysql_native_password)
+--enable_query_log
+
+#
+# Test: Garbage token is rejected
+#
+--disable_query_log
+--replace_result $MASTER_MYSOCK MASTER_MYSOCK $MASTER_MYPORT MASTER_MYPORT
+--error ER_ACCESS_DENIED_ERROR
+--connect (con_garbage, localhost, k8s_test_user, not-a-valid-k8s-token,,,,auth=mysql_clear_password:mysql_native_password)
+--enable_query_log
+
+#
+# Cleanup
+#
+--connection default
+DROP USER 'k8s_test_user';

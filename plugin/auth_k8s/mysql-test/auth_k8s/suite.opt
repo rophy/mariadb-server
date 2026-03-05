@@ -1,4 +1,1 @@
 --plugin-load-add=$AUTH_K8S_SO
---loose-auth-k8s-api-url=$K8S_API_URL
---loose-auth-k8s-ca-path=$K8S_CA_PATH
---loose-auth-k8s-token-path=$K8S_TOKEN_PATH
