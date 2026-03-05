@@ -376,6 +376,7 @@ my_bool tty_password= FALSE;
 
 my_bool opt_lock_ddl_per_table = FALSE;
 static my_bool opt_check_privileges;
+my_bool opt_backup_binlog= TRUE;
 
 extern const char *innodb_checksum_algorithm_names[];
 extern TYPELIB innodb_checksum_algorithm_typelib;
@@ -399,6 +400,7 @@ char *opt_incremental_history_uuid;
 char *opt_user;
 const char *opt_password;
 bool free_opt_password;
+bool free_opt_binlog_directory= false;
 char *opt_host;
 char *opt_defaults_group;
 char *opt_socket;
@@ -1237,7 +1239,7 @@ static void backup_file_op_fail(uint32_t space_id, int type,
 		msg("DDL tracking : create %" PRIu32 " \"%.*s\"",
 			space_id, int(len), name);
 		fail = !check_if_skip_table(spacename.c_str());
-		if (!opt_no_lock && fail &&
+		if (fail && !opt_no_lock &&
 		    check_if_fts_table(spacename.c_str())) {
 			/* Ignore the FTS internal table because InnoDB does
 			create intermediate table and their associative FTS
@@ -1264,6 +1266,11 @@ static void backup_file_op_fail(uint32_t space_id, int type,
 		break;
 	case FILE_DELETE:
 		fail = !check_if_skip_table(spacename.c_str())
+			/* Ignore the FTS internal table because InnoDB may
+			drop intermediate table and their associative FTS
+			internal table as a part of inplace rollback operation.
+			backup_set_alter_copy_lock() downgrades the
+			MDL_BACKUP_DDL before inplace phase of alter */
 			&& !check_if_fts_table(spacename.c_str());
 		msg("DDL tracking : delete %" PRIu32 " \"%.*s\"",
 			space_id, int(len), name);
@@ -1453,7 +1460,9 @@ enum options_xtrabackup
   OPT_XB_IGNORE_INNODB_PAGE_CORRUPTION,
   OPT_INNODB_FORCE_RECOVERY,
   OPT_INNODB_CHECKPOINT,
-  OPT_ARIA_LOG_DIR_PATH
+  OPT_ARIA_LOG_DIR_PATH,
+  OPT_BINLOG,
+  OPT_BINLOG_DIRECTORY
 };
 
 struct my_option xb_client_options[]= {
@@ -1830,11 +1839,8 @@ struct my_option xb_client_options[]= {
      &opt_binlog_info, &opt_binlog_info, &binlog_info_typelib, GET_ENUM,
      OPT_ARG, BINLOG_INFO_AUTO, 0, 0, 0, 0, 0},
 
-    {"secure-auth", OPT_XB_SECURE_AUTH,
-     "Refuse client connecting to server if it"
-     " uses old (pre-4.1.1) protocol.",
-     &opt_secure_auth, &opt_secure_auth, 0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0,
-     0},
+    {"secure-auth", OPT_XB_SECURE_AUTH, "Unused",
+     0, 0, 0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0, 0},
 
     {"log-innodb-page-corruption", OPT_XB_IGNORE_INNODB_PAGE_CORRUPTION,
      "Continue backup if innodb corrupted pages are found. The pages are "
@@ -2117,6 +2123,24 @@ struct my_option xb_server_options[] =
      "Display this help and exit.",
      (G_PTR *) &xtrabackup_help, (G_PTR *) &xtrabackup_help, 0,
      GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+
+  {"binlog", OPT_BINLOG,
+   "Backup the server binary logs. Only applies to server configured with "
+   "--binlog-storage-engine, old-style binlog is not backed up. Enabled by "
+   "default, specify --skip-binlog to not backup the binlog files. The "
+   "--skip-binlog option, if used, must be specified with both --backup and "
+   "--prepare",
+   (G_PTR*)&opt_backup_binlog,
+   (G_PTR*)&opt_backup_binlog,
+   0, GET_BOOL, OPT_ARG, 1, 0, 0, 0, 0, 0},
+
+    {"binlog-directory", OPT_BINLOG_DIRECTORY,
+   "The directory into which to copy any binlog files in the backup. This can "
+   "be used to put binlog files in the correct location if the restored "
+   "server is to be configured with a non-default --binlog-directory. Only "
+   "used with --copy-back",
+   &opt_binlog_directory, &opt_binlog_directory,
+   0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0 },
 
   { 0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
 };
@@ -2433,6 +2457,10 @@ xb_get_one_option(const struct my_option *opt,
     if (my_handle_options_init_variables)
       fprintf(stderr, "Obsolete option: %s. Ignored\n", opt->name);
     break;
+  case OPT_BINLOG_DIRECTORY:
+
+    ADD_PRINT_PARAM_OPT(opt_binlog_directory);
+    break;
 #define MYSQL_CLIENT
 #include "sslopt-case.h"
 #undef MYSQL_CLIENT
@@ -2598,6 +2626,13 @@ static bool innodb_init_param()
 
 	if (!srv_undo_dir || !xtrabackup_backup) {
 		srv_undo_dir = (char*) ".";
+	}
+
+	if (!opt_binlog_directory || !xtrabackup_backup) {
+		if (free_opt_binlog_directory)
+			my_free(const_cast<char *>(opt_binlog_directory));
+		opt_binlog_directory = ".";
+		free_opt_binlog_directory= false;
 	}
 
 	compile_time_assert(SRV_FORCE_IGNORE_CORRUPT == 1);
@@ -5391,6 +5426,29 @@ class BackupStages {
 			return res;
 		}
 
+		bool do_backup_binlogs() {
+			// Copy InnoDB binlog files.
+			// Going to BACKUP STAGE START protects against RESET
+			// MASTER deleting files during the copy, or FLUSH
+			// BINARY LOGS truncating them.
+			if (!opt_no_lock)
+				xb_mysql_query(mysql_connection, "BACKUP STAGE START",
+					       false, false);
+			if (!m_common_backup.copy_engine_binlogs(opt_binlog_directory,
+                                                                 recv_sys.lsn)) {
+				msg("Error on copy InnoDB binlog files");
+				return false;
+			}
+			if (!m_common_backup.wait_for_finish()) {
+				msg("InnoDB binlog file backup process is finished with error");
+				return false;
+			}
+			if (!opt_no_lock)
+				xb_mysql_query(mysql_connection, "BACKUP STAGE END",
+					       false, false);
+			return true;
+		}
+
 		bool stage_end(Backup_datasinks &backup_datasinks) {
 			msg("Starting BACKUP STAGE END");
 			/* release all locks */
@@ -5410,6 +5468,11 @@ class BackupStages {
 					dbug_emulate_ddl_on_intermediate_table_thread,
 					nullptr);
 			);
+
+                        if (opt_backup_binlog) {
+				if (!do_backup_binlogs())
+					return false;
+			}
 
 			backup_finish(backup_datasinks.m_data);
 			return true;
@@ -5504,6 +5567,7 @@ fail:
 		if (fil_system.is_initialised()) {
 			innodb_shutdown();
 		}
+                backup_datasinks.destroy();
 		return(false);
 	}
 
@@ -5877,6 +5941,8 @@ void CorruptedPages::backup_fix_ddl(ds_ctxt *ds_data, ds_ctxt *ds_meta)
 					 node, 0, dest_name.c_str(),
 					 wf_write_through, *this);
 	}
+
+	DBUG_MARIABACKUP_EVENT("after_backup_fix_ddl", {});
 }
 
 
@@ -6120,16 +6186,12 @@ exit:
 	ut_ad(fil_space_t::physical_size(flags) == info.page_size);
 
 	mysql_mutex_lock(&fil_system.mutex);
-	fil_space_t* space = fil_space_t::create(uint32_t(info.space_id),
-						 flags, false, 0,
-						 FIL_ENCRYPTION_DEFAULT, true);
+	std::ignore = fil_space_t::create(uint32_t(info.space_id),
+					  flags, false, 0,
+					  FIL_ENCRYPTION_DEFAULT, true);
 	mysql_mutex_unlock(&fil_system.mutex);
-	if (space) {
-		*success = xb_space_create_file(real_name, info.space_id,
-						flags, &file);
-	} else {
-		msg("Can't create tablespace %s\n", dest_space_name);
-	}
+	*success = xb_space_create_file(real_name, info.space_id,
+					flags, &file);
 
 	goto exit;
 }
@@ -7692,6 +7754,8 @@ int main(int argc, char **argv)
           my_free((char*) opt_password);
         plugin_shutdown();
         free_list(opt_plugin_load_list_ptr);
+        if (free_opt_binlog_directory)
+          my_free(const_cast<char *>(opt_binlog_directory));
         mysql_server_end();
         sys_var_end();
 

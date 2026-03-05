@@ -54,6 +54,7 @@ Created 9/20/1997 Heikki Tuuri
 #include "srv0srv.h"
 #include "srv0start.h"
 #include "fil0pagecompress.h"
+#include "innodb_binlog.h"
 #include "log.h"
 
 /** The recovery system */
@@ -636,6 +637,9 @@ struct file_name_t {
 	/** Status of the tablespace */
 	fil_status	status;
 
+	/** Log sequence number of a FILE_CREATE record, or 0 */
+	lsn_t		create_lsn = 0;
+
 	/** FSP_SIZE of tablespace */
 	uint32_t	size = 0;
 
@@ -1206,7 +1210,8 @@ inline size_t recv_sys_t::files_size()
 @param[in]	name		file name
 @param[in]	len		length of the file name
 @param[in]	space_id	the tablespace ID
-@param[in]	ftype		FILE_MODIFY, FILE_DELETE, or FILE_RENAME
+@param[in]	ftype		FILE_CREATE, FILE_MODIFY, FILE_DELETE,
+				or FILE_RENAME
 @param[in]	lsn		lsn of the redo log
 @param[in]	if_exists	whether to check if the tablespace exists */
 static void fil_name_process(const char *name, ulint len, uint32_t space_id,
@@ -1249,6 +1254,7 @@ got_deleted:
 		}
 
 		ut_ad(f.space == NULL);
+		goto reset_create;
 	} else if (p.second // the first FILE_MODIFY or FILE_RENAME
 		   || f.name != fname.name) {
 reload:
@@ -1317,6 +1323,10 @@ rename:
 				break;
 			}
 
+			if (f.create_lsn) {
+				return;
+			}
+
 			if (srv_force_recovery
 			    || srv_operation == SRV_OPERATION_RESTORE) {
 				/* Without innodb_force_recovery,
@@ -1334,7 +1344,7 @@ rename:
 					int(fname.name.size()),
 					fname.name.data(), space_id);
 			}
-			break;
+			return;
 
 		case FIL_LOAD_DEFER:
 			if (d && ftype == FILE_RENAME
@@ -1370,6 +1380,10 @@ rename:
 					  " due to innodb_force_recovery",
 					  int(len), name, space_id);
 		}
+reset_create:
+		f.create_lsn = 0;
+	} else if (ftype == FILE_CREATE && !f.space) {
+		f.create_lsn = lsn;
 	}
 }
 
@@ -2175,8 +2189,13 @@ void store_freed_or_init_rec(page_id_t page_id, bool freed) noexcept
   uint32_t page_no= page_id.page_no();
   if (space_id == TRX_SYS_SPACE || srv_is_undo_tablespace(space_id))
   {
-    if (srv_immediate_scrub_data_uncompressed)
-      fil_space_get(space_id)->free_page(page_no, freed);
+    if (!srv_immediate_scrub_data_uncompressed)
+      return;
+    fil_space_t *space= fil_space_get(space_id);
+    if (freed)
+      space->free_page<true>(page_no);
+    else
+      space->free_page<false>(page_no);
     return;
   }
 
@@ -2562,6 +2581,25 @@ void recv_sys_t::parse_page0(const page_id_t id, const byte *b,
   fil_space_set_recv_size_and_flags(space_id, s, f);
 }
 
+ATTRIBUTE_COLD
+ATTRIBUTE_NOINLINE
+bool recv_sys_t::parse_store_binlog(uint32_t space_id, const byte *l,
+                                    uint32_t rlen, uint32_t page_no,
+                                    lsn_t start_lsn, lsn_t lsn)
+{
+  const size_t olen= mlog_decode_varint_length(*l);
+  if (UNIV_UNLIKELY(olen >= rlen) || UNIV_UNLIKELY(olen > 3))
+    return true;
+  const uint32_t offset= mlog_decode_varint(l);
+  ut_ad(offset != MLOG_DECODE_ERROR);
+  if (UNIV_UNLIKELY(offset + rlen - olen >= 65535))
+    return true;
+  if (binlog_recover_write_data(space_id & 1, page_no, uint16_t(offset),
+                                start_lsn, lsn, l + olen, rlen - olen))
+    return true;
+  return false;
+}
+
 ATTRIBUTE_NOINLINE
 bool recv_sys_t::parse_store_if_exists(uint32_t space_id) const noexcept
 {
@@ -2756,7 +2794,8 @@ log_parse_file(const page_id_t id, bool if_exists,
 
     if (space_id == TRX_SYS_SPACE || srv_is_undo_tablespace(space_id))
       goto file_rec_error;
-    if (fnend - l < 4 || memcmp(fnend - 4, DOT_IBD, 4))
+    if (fnend - l < 4 ||
+        (memcmp(fnend - 4, DOT_IBD, 4) && memcmp(fnend - 4, DOT_IBB, 4)))
       goto file_rec_error;
 
     if (UNIV_UNLIKELY(!recv_needed_recovery && srv_read_only_mode))
@@ -2772,7 +2811,7 @@ log_parse_file(const page_id_t id, bool if_exists,
     }
 
     fil_name_process(reinterpret_cast<const char*>(l), fnend - l, space_id,
-                     (b & 0xf0) == FILE_DELETE ? FILE_DELETE : FILE_MODIFY,
+                     fn2 ? FILE_MODIFY : mfile_type_t(b & 0xf0),
                      recv_sys.start_lsn, if_exists);
 
     if (fn2)
@@ -2808,7 +2847,7 @@ static recv_sys_t::parse_mtr_result
 log_page_modify(uint32_t space_id, uint32_t page_no) noexcept
 {
   ut_ad(space_id);
-  if (srv_is_undo_tablespace(space_id))
+  if (space_id >= SRV_SPACE_ID_UPPER_BOUND || srv_is_undo_tablespace(space_id))
     return recv_sys_t::OK;
   recv_spaces_t::iterator i= recv_spaces.lower_bound(space_id);
   const lsn_t lsn{recv_sys.lsn};
@@ -2893,6 +2932,7 @@ restart:
         return r;
 
     l= mtr_t::parse_length(l, &rlen);
+    bool is_binlog= false;
     uint32_t idlen;
     if ((b & 0x80) && got_page_op)
     {
@@ -2928,6 +2968,8 @@ restart:
     space_id= mlog_decode_varint(l);
     if (UNIV_UNLIKELY(space_id == MLOG_DECODE_ERROR))
       goto page_id_corrupted;
+    static_assert((LOG_BINLOG_ID_0 | 1) == LOG_BINLOG_ID_1, "");
+    is_binlog= !ENC_10_8 && (space_id | 1) == LOG_BINLOG_ID_1;
     l+= idlen;
     rlen-= idlen;
     idlen= mlog_decode_varint_length(*l);
@@ -2978,7 +3020,7 @@ restart:
         }
     same_page:
       if (!rlen);
-      else if (UNIV_UNLIKELY(size_t(l - recs) + rlen > srv_page_size))
+      else if (!is_binlog && UNIV_UNLIKELY(size_t(l - recs) + rlen > srv_page_size))
         goto record_corrupted;
       const page_id_t id{space_id, page_no};
       ut_d(if ((b & 0x70) == INIT_PAGE || (b & 0x70) == OPTION)
@@ -3068,12 +3110,15 @@ restart:
         /* fall through */
       case RESERVED:
         continue;
-      case WRITE:
       case MEMMOVE:
       case MEMSET:
+        if (storing == YES && !ENC_10_8 && is_binlog)
+          goto record_corrupted;
+        /* fall through */
+      case WRITE:
         if (storing == BACKUP)
           continue;
-        if (storing == NO && UNIV_LIKELY(page_no != 0))
+        if (storing == NO && UNIV_LIKELY((page_no | (uint32_t)is_binlog) != 0))
           /* fil_space_set_recv_size_and_flags() is mandatory for storing==NO.
           It is only applicable to page_no == 0. Other than that, we can just
           ignore the payload and only compute the mini-transaction checksum;
@@ -3083,24 +3128,28 @@ restart:
           goto record_corrupted;
         if (ENC_10_8)
           cl= log_decrypt_legacy(iv, recs, l, rlen, decrypt_buf);
-        const uint32_t olen= mlog_decode_varint_length(*(ENC_10_8 ? cl : l));
-        if (UNIV_UNLIKELY(olen >= rlen) || UNIV_UNLIKELY(olen > 3))
-          goto record_corrupted;
-        const uint32_t offset= mlog_decode_varint(ENC_10_8 ? cl : l);
-        ut_ad(offset != MLOG_DECODE_ERROR);
-        static_assert(FIL_PAGE_OFFSET == 4, "compatibility");
-        if (UNIV_UNLIKELY(offset >= srv_page_size))
-          goto record_corrupted;
-        last_offset+= offset;
-        if (UNIV_UNLIKELY(last_offset < 8 || last_offset >= srv_page_size))
-          goto record_corrupted;
-        (ENC_10_8 ? cl : l)+= olen;
-        rlen-= olen;
+        if (!is_binlog)
+        {
+          const uint32_t olen= mlog_decode_varint_length(*(ENC_10_8 ? cl : l));
+          if (UNIV_UNLIKELY(olen >= rlen) || UNIV_UNLIKELY(olen > 3))
+            goto record_corrupted;
+          const uint32_t offset= mlog_decode_varint(ENC_10_8 ? cl : l);
+          ut_ad(offset != MLOG_DECODE_ERROR);
+          static_assert(FIL_PAGE_OFFSET == 4, "compatibility");
+          if (UNIV_UNLIKELY(offset >= srv_page_size))
+            goto record_corrupted;
+          last_offset+= offset;
+          if (UNIV_UNLIKELY(last_offset < 8 || last_offset >= srv_page_size))
+            goto record_corrupted;
+          (ENC_10_8 ? cl : l)+= olen;
+          rlen-= olen;
+        }
         if ((b & 0x70) == WRITE)
         {
-          if (UNIV_UNLIKELY(rlen + last_offset > srv_page_size))
+          if (!ENC_10_8 && is_binlog);
+          else if (UNIV_UNLIKELY(rlen + last_offset > srv_page_size))
             goto record_corrupted;
-          if (UNIV_UNLIKELY(!page_no) && file_checkpoint)
+          else if (UNIV_UNLIKELY(!page_no) && file_checkpoint)
           {
             const bool has_size= last_offset <= FSP_HEADER_OFFSET + FSP_SIZE &&
               last_offset + rlen >= FSP_HEADER_OFFSET + FSP_SIZE + 4;
@@ -3125,7 +3174,7 @@ restart:
           goto record_corrupted;
         const uint32_t len= mlog_decode_varint(ENC_10_8 ? cl : l);
         ut_ad(len != MLOG_DECODE_ERROR);
-        if (UNIV_UNLIKELY(last_offset + len > srv_page_size))
+        if (UNIV_UNLIKELY(last_offset + len > srv_page_size) || is_binlog)
           goto record_corrupted;
         (ENC_10_8 ? cl : l)+= llen;
         rlen-= llen;
@@ -3162,6 +3211,11 @@ restart:
       }
 #endif
       if (storing != YES);
+      else if (!ENC_10_8 && is_binlog)
+      {
+        if (parse_store_binlog(space_id, l, rlen, page_no, start_lsn, lsn))
+          goto record_corrupted;
+      }
       else if (if_exists && !parse_store_if_exists(space_id));
       else if (UNIV_UNLIKELY(parse_store(id, ENC_10_8 && l != cl
                                          ? decrypt_buf : recs,
@@ -4383,6 +4437,7 @@ static bool recv_scan_log(bool last_phase, const recv_sys_t::parser *parser)
     ut_ad(!rewound_lsn);
     ut_ad(recv_sys.lsn >= recv_sys.file_checkpoint);
     log_sys.set_recovered_lsn(recv_sys.lsn);
+    binlog_recover_end(recv_sys.lsn);
   }
   else if (rewound_lsn)
   {
@@ -4390,6 +4445,9 @@ static bool recv_scan_log(bool last_phase, const recv_sys_t::parser *parser)
     ut_ad(recv_sys.file_checkpoint);
     recv_sys.lsn= rewound_lsn;
   }
+  else if (store)
+    binlog_recover_end(recv_sys.lsn);
+
 func_exit:
   ut_d(recv_sys.after_apply= last_phase);
   mysql_mutex_unlock(&recv_sys.mutex);
@@ -4484,6 +4542,11 @@ next:
 		case file_name_t::NORMAL:
 			goto next;
 		case file_name_t::MISSING:
+			if (srv_operation != SRV_OPERATION_NORMAL) {
+			} else if (const lsn_t c = i->second.create_lsn) {
+				deferred_spaces.add(space, i->second.name, c);
+				goto next;
+			}
 			err = recv_init_missing_space(err, i);
 			i->second.status = file_name_t::DELETED;
 			/* fall through */

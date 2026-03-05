@@ -49,6 +49,7 @@ Created 3/26/1996 Heikki Tuuri
 #include "trx0xa.h"
 #include "ut0pool.h"
 #include "ut0vec.h"
+#include "innodb_binlog.h"
 #include "log.h"
 
 #include <set>
@@ -113,6 +114,8 @@ trx_init(
 	trx->op_info = "";
 
 	trx->active_commit_ordered = false;
+
+	trx->active_prepare = false;
 
 	trx->isolation_level = TRX_ISO_REPEATABLE_READ;
 
@@ -363,7 +366,7 @@ trx_t *trx_create()
 }
 
 /** Free the memory to trx_pools */
-void trx_t::free()
+void trx_t::free() noexcept
 {
   autoinc_locks.fake_defined();
 #ifdef HAVE_MEM_CHECK
@@ -391,8 +394,10 @@ void trx_t::free()
   ut_ad(magic_n == TRX_MAGIC_N);
   ut_ad(!read_only);
   ut_ad(!lock.wait_lock);
+  ut_ad(!commit_lsn);
 
   dict_operation= false;
+  commit_lsn= 0;
   trx_sys.deregister_trx(this);
   check_unique_secondary= true;
   check_foreigns= true;
@@ -420,6 +425,7 @@ void trx_t::free()
                                    bulk_insert */);
   MEM_NOACCESS(&is_registered, sizeof is_registered);
   MEM_NOACCESS(&active_commit_ordered, sizeof active_commit_ordered);
+  MEM_NOACCESS(&active_prepare, sizeof active_prepare);
   MEM_NOACCESS(&flush_log_later, sizeof flush_log_later);
   MEM_NOACCESS(&duplicates, sizeof duplicates);
   MEM_NOACCESS(&dict_operation, sizeof dict_operation);
@@ -821,6 +827,7 @@ static void trx_assign_rseg_low(trx_t *trx)
 	undo tablespaces that are scheduled for truncation. */
 	static Atomic_counter<unsigned>	rseg_slot;
 	unsigned slot = rseg_slot++ % TRX_SYS_N_RSEGS;
+	DBUG_EXECUTE_IF("assign_same_rseg", slot= 0;);
 	ut_d(const auto start_scan_slot = slot);
 	ut_d(bool look_for_rollover = false);
 	trx_rseg_t*	rseg;
@@ -833,6 +840,8 @@ static void trx_assign_rseg_low(trx_t *trx)
 			ut_ad(!look_for_rollover || start_scan_slot != slot);
 			ut_d(look_for_rollover = true);
 			slot = (slot + 1) % TRX_SYS_N_RSEGS;
+			DBUG_EXECUTE_IF("assign_same_rseg",
+				slot= (slot - 1) % TRX_SYS_N_RSEGS;);
 
 			if (!rseg->space) {
 				continue;
@@ -1133,6 +1142,7 @@ inline void trx_t::write_serialisation_history(mtr_t *mtr)
   ut_ad(!read_only);
   trx_rseg_t *rseg= rsegs.m_redo.rseg;
   trx_undo_t *&undo= rsegs.m_redo.undo;
+  binlog_oob_context *binlog_ctx= nullptr;
   if (UNIV_LIKELY(undo != nullptr))
   {
     MONITOR_INC(MONITOR_TRX_COMMIT_UNDO);
@@ -1172,6 +1182,11 @@ inline void trx_t::write_serialisation_history(mtr_t *mtr)
     }
     else
       trx_sys.assign_new_trx_no(this);
+
+    /* Include binlog data in the commit record, if any. */
+    if (active_commit_ordered)
+      binlog_ctx= innodb_binlog_trx(this, mtr);
+
     UT_LIST_REMOVE(rseg->undo_list, undo);
     /* Change the undo log segment state from TRX_UNDO_ACTIVE, to
     define the transaction as committed in the file based domain,
@@ -1185,6 +1200,7 @@ inline void trx_t::write_serialisation_history(mtr_t *mtr)
     rseg->release();
   mtr->commit();
   commit_lsn= undo_no || !xid.is_null() ? mtr->commit_lsn() : 0;
+  innodb_binlog_post_commit(mtr, binlog_ctx);
 }
 
 /********************************************************************
@@ -1265,6 +1281,8 @@ static void trx_flush_log_if_needed(lsn_t lsn, trx_t *trx)
 
   if (log_sys.get_flushed_lsn(std::memory_order_relaxed) >= lsn)
     return;
+
+  ut_ad(!trx->mysql_thd || !trx->mysql_thd->tx_read_only);
 
   const bool flush= srv_flush_log_at_trx_commit & 1;
   if (!log_sys.is_mmap())
@@ -1741,12 +1759,14 @@ void trx_commit_complete_for_mysql(trx_t *trx)
     return;
   switch (srv_flush_log_at_trx_commit) {
   case 0:
-    return;
+    goto func_exit;
   case 1:
-    if (trx->active_commit_ordered)
+    if (trx->active_commit_ordered && trx->active_prepare)
       return;
   }
   trx_flush_log_if_needed(lsn, trx);
+ func_exit:
+  trx->commit_lsn= 0;
 }
 
 /**********************************************************************//**

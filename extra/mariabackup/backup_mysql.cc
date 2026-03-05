@@ -148,7 +148,7 @@ xb_mysql_connect()
 	char mysql_port_str[std::numeric_limits<int>::digits10 + 3];
 	const char *user= opt_user ? opt_user : get_os_user();
 
-	sprintf(mysql_port_str, "%d", opt_port);
+	snprintf(mysql_port_str, sizeof(mysql_port_str), "%d", opt_port);
 
 	if (connection == NULL) {
 		msg("Failed to init MariaDB struct: %s.",
@@ -162,11 +162,6 @@ xb_mysql_connect()
 		opt_password=getenv("MYSQL_PWD");
 	}
 #endif
-
-	if (!opt_secure_auth) {
-		mysql_options(connection, MYSQL_SECURE_AUTH,
-			      (char *) &opt_secure_auth);
-	}
 
 	if (xb_plugin_dir && *xb_plugin_dir){
 		mysql_options(connection, MYSQL_PLUGIN_DIR, xb_plugin_dir);
@@ -385,6 +380,7 @@ bool get_mysql_vars(MYSQL *connection)
   char *aria_log_dir_path_var= NULL;
   char *page_zip_level_var= NULL;
   char *ignore_db_dirs= NULL;
+  char *binlog_directory_var= NULL;
   char *endptr;
   ulong server_version= mysql_get_server_version(connection);
 
@@ -411,6 +407,7 @@ bool get_mysql_vars(MYSQL *connection)
       {"innodb_compression_level", &page_zip_level_var},
       {"ignore_db_dirs", &ignore_db_dirs},
       {"aria_log_dir_path", &aria_log_dir_path_var},
+      {"binlog_directory", &binlog_directory_var},
       {NULL, NULL}};
 
   read_mysql_variables(connection, "SHOW VARIABLES", mysql_vars, true);
@@ -547,7 +544,15 @@ bool get_mysql_vars(MYSQL *connection)
   if (ignore_db_dirs)
     xb_load_list_string(ignore_db_dirs, ",", register_ignore_db_dirs_filter);
 
+  if (free_opt_binlog_directory)
+    my_free(const_cast<char *>(opt_binlog_directory));
+  opt_binlog_directory= my_strdup(PSI_NOT_INSTRUMENTED,
+                                  (binlog_directory_var ? binlog_directory_var : ""),
+                                  MYF(MY_FAE));
+  free_opt_binlog_directory= true;
+
 out:
+  free_mysql_variables(mysql_vars);
 
   return (ret);
 }
@@ -1515,7 +1520,9 @@ write_galera_info(ds_ctxt *datasink, MYSQL *connection)
       domain_id ? domain_id : domain_id55);
 
 cleanup:
+  free_mysql_variables(vars);
   free_mysql_variables(status);
+  free_mysql_variables(value);
 
   return(result);
 }

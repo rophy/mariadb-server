@@ -3013,11 +3013,9 @@ int ha_maria::external_lock(THD *thd, int lock_type)
             !trnman_decrement_locked_tables(trn))
         {
           /*
-            OK should not have been sent to client yet (ACID).
-            This is a bit excessive, ACID requires this only if there are some
-            changes to commit (rollback shouldn't be tested).
+            OK should not have been sent to client in case of write (ACID).
           */
-          DBUG_ASSERT(!thd->get_stmt_da()->is_sent() ||
+          DBUG_ASSERT(!trn->undo_lsn || !thd->get_stmt_da()->is_sent() ||
                       thd->killed);
           /*
             If autocommit, commit transaction. This can happen when open and
@@ -3087,17 +3085,23 @@ int ha_maria::start_stmt(THD *thd, thr_lock_type lock_type)
   Reset THD_TRN and all file->trn related to the transaction
   This is needed as some calls, like extra() or external_lock() may access
   it before next transaction is started
+  Note that trn for the table is already freed and may be reused by another
+  thread.
 */
 
 static void reset_thd_trn(THD *thd, MARIA_HA *first_table)
 {
+  MARIA_HA *next;
+  TRN *trn __attribute__((unused)) = first_table ? first_table->trn : 0;
   DBUG_ENTER("reset_thd_trn");
   thd_set_ha_data(thd, maria_hton, 0);
-  MARIA_HA *next;
   for (MARIA_HA *table= first_table; table ; table= next)
   {
+    DBUG_ASSERT(table->trn == trn);
     next= table->trn_next;
-    _ma_reset_trn_for_table(table);
+    table->trn_prev= 0;
+    table->trn_next= 0;
+    table->trn= 0;
 
     /*
       If table has changed by this statement, invalidate it from the query
@@ -3180,13 +3184,15 @@ int ha_maria::implicit_commit(THD *thd, bool new_trn)
     statement assuming they have a trn (see ha_maria::start_stmt()).
   */
   trn= trnman_new_trn(& thd->transaction->wt);
-  thd_set_ha_data(thd, maria_hton, trn);
   if (unlikely(trn == NULL))
   {
-    reset_thd_trn(thd, used_tables);
+    reset_thd_trn(thd, used_tables);            // Calls thd_set_ha_data()
     error= HA_ERR_OUT_OF_MEM;
     goto end;
   }
+  else
+    thd_set_ha_data(thd, maria_hton, trn);
+
   /*
     Move all locked tables to the new transaction
     We must do it here as otherwise file->thd and file->state may be
@@ -3200,6 +3206,14 @@ int ha_maria::implicit_commit(THD *thd, bool new_trn)
   {
     trn_next= handler->trn_next;
     DBUG_ASSERT(handler->s->base.born_transactional);
+
+    /*
+      We reset the link to the old trn to avoid the asserts
+      in _ma_set_trn_for_table()
+    */
+    handler->trn_next= 0;
+    handler->trn_prev= 0;
+    handler->trn= 0;
 
     /* If handler uses versioning */
     if (handler->s->lock_key_trees)
@@ -3335,7 +3349,6 @@ int ha_maria::create(const char *name, TABLE *table_arg,
   MARIA_CREATE_INFO create_info;
   TABLE_SHARE *share= table_arg->s;
   uint options= share->db_options_in_use;
-  ha_table_option_struct *table_options= table_arg->s->option_struct;
   enum data_file_type row_type;
   THD *thd= current_thd;
   DBUG_ENTER("ha_maria::create");
@@ -3383,8 +3396,8 @@ int ha_maria::create(const char *name, TABLE *table_arg,
   if (ht != maria_hton)
   {
     /* S3 engine */
-    create_info.s3_block_size= (ulong) table_options->s3_block_size;
-    create_info.compression_algorithm= table_options->compression_algorithm;
+    create_info.s3_block_size= (ulong) option_struct->s3_block_size;
+    create_info.compression_algorithm= option_struct->compression_algorithm;
   }
 
   /*
@@ -3635,7 +3648,6 @@ static int maria_commit(THD *thd, bool all)
   if (ma_commit(trn))
     res= HA_ERR_COMMIT_ERROR;
   reset_thd_trn(thd, used_instances);
-  thd_set_ha_data(thd, maria_hton, 0);
   DBUG_RETURN(res);
 }
 

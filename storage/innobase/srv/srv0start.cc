@@ -87,6 +87,7 @@ Created 2/16/1996 Heikki Tuuri
 #include "row0mysql.h"
 #include "btr0pcur.h"
 #include "ibuf0ibuf.h"
+#include "innodb_binlog.h"
 #include "zlib.h"
 #include "log.h"
 
@@ -1375,13 +1376,12 @@ dberr_t srv_start(bool create_new_db)
 
 	if (!srv_read_only_mode) {
 		if (srv_innodb_status) {
-
+			const size_t len = strlen(fil_path_to_mysql_datadir) +
+				20 + sizeof "/innodb_status.";
 			srv_monitor_file_name = static_cast<char*>(
-				ut_malloc_nokey(
-					strlen(fil_path_to_mysql_datadir)
-					+ 20 + sizeof "/innodb_status."));
+				ut_malloc_nokey(len));
 
-			sprintf(srv_monitor_file_name,
+			snprintf(srv_monitor_file_name, len,
 				"%s/innodb_status." ULINTPF,
 				fil_path_to_mysql_datadir,
 				static_cast<ulint>
@@ -1968,6 +1968,14 @@ skip_monitors:
 		return(srv_init_abort(err));
 	}
 
+        err= innodb_binlog_startup_init();
+        if (UNIV_UNLIKELY(err != DB_SUCCESS))
+        {
+          sql_print_error("InnoDB: Could not initialize the binlog in InnoDB, "
+                          "aborting");
+          return(srv_init_abort(DB_ERROR));
+        }
+
 	if (!srv_read_only_mode
 	    && srv_operation <= SRV_OPERATION_EXPORT_RESTORED) {
 		/* Initialize the innodb_temporary tablespace and keep
@@ -2100,6 +2108,7 @@ void innodb_shutdown()
 		logs_empty_and_mark_files_at_shutdown();
 	}
 
+        innodb_binlog_close(true);
 	os_aio_free();
 	fil_space_t::close_all();
 	/* Exit any remaining threads. */

@@ -30,6 +30,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #define MYSQL_SERVER
 #include "univ.i"
+#include "my_bit.h"
 
 /* Include necessary SQL headers */
 #include "ha_prototypes.h"
@@ -54,6 +55,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "sql_type_geom.h"
 #include "scope.h"
 #include "srv0srv.h"
+
+bool is_update_query(enum enum_sql_command command);
 
 // MYSQL_PLUGIN_IMPORT extern my_bool lower_case_file_system;
 // MYSQL_PLUGIN_IMPORT extern char mysql_unpacked_real_data_home[];
@@ -107,6 +110,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "fil0pagecompress.h"
 #include "ut0mem.h"
 #include "row0ext.h"
+#include "innodb_binlog.h"
 
 #include "lz4.h"
 #include "lzo/lzo1x.h"
@@ -530,6 +534,12 @@ mysql_pfs_key_t	trx_pool_manager_mutex_key;
 mysql_pfs_key_t	lock_wait_mutex_key;
 mysql_pfs_key_t	trx_sys_mutex_key;
 mysql_pfs_key_t	srv_threads_mutex_key;
+mysql_pfs_key_t fsp_active_binlog_mutex_key;
+mysql_pfs_key_t fsp_binlog_durable_mutex_key;
+mysql_pfs_key_t fsp_binlog_durable_cond_key;
+mysql_pfs_key_t fsp_purge_binlog_mutex_key;
+mysql_pfs_key_t fsp_page_fifo_mutex_key;
+mysql_pfs_key_t ibb_xid_hash_mutex_key;
 
 /* all_innodb_mutexes array contains mutexes that are
 performance schema instrumented if "UNIV_PFS_MUTEX"
@@ -1623,25 +1633,6 @@ innodb_enable_monitor_at_startup(
 /*=============================*/
 	char*	str);	/*!< in: monitor counter enable list */
 
-#ifdef MYSQL_STORE_FTS_DOC_ID
-/** Store doc_id value into FTS_DOC_ID field
-@param[in,out]	tbl	table containing FULLTEXT index
-@param[in]	doc_id	FTS_DOC_ID value */
-static
-void
-innobase_fts_store_docid(
-	TABLE*		tbl,
-	ulonglong	doc_id)
-{
-	my_bitmap_map*	old_map
-		= dbug_tmp_use_all_columns(tbl, tbl->write_set);
-
-	tbl->fts_doc_id_field->store(static_cast<longlong>(doc_id), true);
-
-	dbug_tmp_restore_column_map(tbl->write_set, old_map);
-}
-#endif
-
 /*******************************************************************//**
 Function for constructing an InnoDB table handler instance. */
 static
@@ -2000,7 +1991,7 @@ fail:
 
 all_fail:
   mtr.commit();
-  trx->free();
+  trx->clear_and_free();
   ut_free(pcur.old_rec_buf);
   ut_d(purge_sys.resume_FTS());
 }
@@ -2392,6 +2383,7 @@ static bool is_mysql_datadir_path(const char *path)
   convert_dirname(mysql_data_dir, mysql_unpacked_real_data_home, NullS);
   size_t mysql_data_home_len= dirname_length(mysql_data_dir);
   size_t path_len = dirname_length(path_dir);
+  my_bool part_matched;
 
   if (path_len < mysql_data_home_len)
     return true;
@@ -2402,7 +2394,7 @@ static bool is_mysql_datadir_path(const char *path)
   return(files_charset_info->strnncoll((uchar *) path_dir, path_len,
                                        (uchar *) mysql_data_dir,
                                        mysql_data_home_len,
-                                       TRUE));
+                                       &part_matched));
 }
 
 /*********************************************************************//**
@@ -2466,72 +2458,6 @@ innobase_raw_format(
 	return(ut_str_sql_format(buf_tmp, buf_tmp_used, buf, buf_size));
 }
 
-/*
-The helper function nlz(x) calculates the number of leading zeros
-in the binary representation of the number "x", either using a
-built-in compiler function or a substitute trick based on the use
-of the multiplication operation and a table indexed by the prefix
-of the multiplication result:
-*/
-#ifdef __GNUC__
-#define nlz(x) __builtin_clzll(x)
-#elif defined(_MSC_VER) && !defined(_M_CEE_PURE) && \
-  (defined(_M_IX86) || defined(_M_X64) || defined(_M_ARM64))
-#ifndef __INTRIN_H_
-#pragma warning(push, 4)
-#pragma warning(disable: 4255 4668)
-#include <intrin.h>
-#pragma warning(pop)
-#endif
-__forceinline unsigned int nlz (ulonglong x)
-{
-#if defined(_M_IX86) || defined(_M_X64)
-  unsigned long n;
-#ifdef _M_X64
-  _BitScanReverse64(&n, x);
-  return (unsigned int) n ^ 63;
-#else
-  unsigned long y = (unsigned long) (x >> 32);
-  unsigned int m = 31;
-  if (y == 0)
-  {
-    y = (unsigned long) x;
-    m = 63;
-  }
-  _BitScanReverse(&n, y);
-  return (unsigned int) n ^ m;
-#endif
-#elif defined(_M_ARM64)
-  return _CountLeadingZeros64(x);
-#endif
-}
-#else
-inline unsigned int nlz (ulonglong x)
-{
-  static unsigned char table [48] = {
-    32,  6,  5,  0,  4, 12,  0, 20,
-    15,  3, 11,  0,  0, 18, 25, 31,
-     8, 14,  2,  0, 10,  0,  0,  0,
-     0,  0,  0, 21,  0,  0, 19, 26,
-     7,  0, 13,  0, 16,  1, 22, 27,
-     9,  0, 17, 23, 28, 24, 29, 30
-  };
-  unsigned int y= (unsigned int) (x >> 32);
-  unsigned int n= 0;
-  if (y == 0) {
-    y= (unsigned int) x;
-    n= 32;
-  }
-  y = y | (y >> 1); // Propagate leftmost 1-bit to the right.
-  y = y | (y >> 2);
-  y = y | (y >> 4);
-  y = y | (y >> 8);
-  y = y & ~(y >> 16);
-  y = y * 0x3EF5D037;
-  return n + table[y >> 26];
-}
-#endif
-
 /*********************************************************************//**
 Compute the next autoinc value.
 
@@ -2574,8 +2500,8 @@ innobase_next_autoinc(
 	  operation. The snippet below calculates the product of two numbers
 	  and detects an unsigned integer overflow:
 	*/
-	unsigned int	m= nlz(need);
-	unsigned int	n= nlz(step);
+	unsigned int	m= my_nlz(need);
+	unsigned int	n= my_nlz(step);
 	if (m + n <= 8 * sizeof(ulonglong) - 2) {
 		// The bit width of the original values is too large,
 		// therefore we are guaranteed to get an overflow.
@@ -2761,6 +2687,8 @@ trx_deregister_from_2pc(
 {
   trx->is_registered= false;
   trx->active_commit_ordered= false;
+  trx->active_prepare= false;
+  trx->commit_lsn= 0;
 }
 
 /**
@@ -2889,7 +2817,6 @@ static int innobase_rollback_by_xid(XID *xid) noexcept
     trx_deregister_from_2pc(trx);
     THD* thd= trx->mysql_thd;
     dberr_t err= trx_rollback_for_mysql(trx);
-    ut_ad(!trx->will_lock);
     trx->free();
     return convert_error_code_to_mysql(err, 0, thd);
   }
@@ -3837,6 +3764,16 @@ static int innodb_init_params()
     DBUG_RETURN(HA_ERR_INITIALIZATION);
   }
 
+	if (innodb_binlog_state_interval == 0 ||
+	    innodb_binlog_state_interval !=
+		(ulonglong)1 << (63 - my_nlz(innodb_binlog_state_interval)) ||
+	    innodb_binlog_state_interval % (ulonglong)ibb_page_size) {
+		sql_print_error("InnoDB: innodb_binlog_state_interval must be "
+                                "a power-of-two multiple of the innodb binlog "
+                                "page size=%lu KiB", ibb_page_size >> 10);
+		DBUG_RETURN(HA_ERR_INITIALIZATION);
+	}
+
 #ifdef _WIN32
   if (!is_filename_allowed(srv_buf_dump_filename,
                            strlen(srv_buf_dump_filename), false))
@@ -4085,6 +4022,41 @@ static void innobase_update_optimizer_costs(OPTIMIZER_COSTS *costs)
 }
 
 
+static binlog_file_entry *innodb_get_binlog_file_list(MEM_ROOT *mem_root)
+{
+  uint64_t first, last;
+  if (innodb_find_binlogs(&first, &last))
+    return nullptr;
+  binlog_file_entry *list;
+  binlog_file_entry **next_ptr= &list;
+  for (uint64_t i= first; i <= last; ++i)
+  {
+    binlog_file_entry *e= (binlog_file_entry *)alloc_root(mem_root, sizeof(*e));
+    if (!e)
+      return nullptr;
+    char name_buf[OS_FILE_MAX_PATH];
+    binlog_name_make(name_buf, i);
+    e->name.length= strlen(name_buf);
+    char *str= static_cast<char *>(alloc_root(mem_root, e->name.length + 1));
+    if (!str)
+      return nullptr;
+    strcpy(str, name_buf);
+    e->name.str= str;
+    *next_ptr= e;
+    next_ptr= &(e->next);
+  }
+  *next_ptr= nullptr;
+  return list;
+}
+
+
+static bool
+innodb_binlog_flush()
+{
+  return fsp_binlog_flush();
+}
+
+
 /** Initialize the InnoDB storage engine plugin.
 @param[in,out]	p	InnoDB handlerton
 @return error code
@@ -4158,6 +4130,32 @@ static int innodb_init(void* p)
 		= innodb_prepare_commit_versioned;
 
         innobase_hton->update_optimizer_costs= innobase_update_optimizer_costs;
+        innobase_hton->binlog_init= innodb_binlog_init;
+        innobase_hton->set_binlog_max_size= ibb_set_max_size;
+        innobase_hton->binlog_write_direct_ordered=
+          innobase_binlog_write_direct_ordered;
+        innobase_hton->binlog_write_direct= innobase_binlog_write_direct;
+        innobase_hton->binlog_group_commit_ordered= ibb_group_commit;
+        innobase_hton->binlog_oob_data_ordered= innodb_binlog_oob_ordered;
+        innobase_hton->binlog_oob_data= innodb_binlog_oob;
+        innobase_hton->binlog_savepoint_rollback= ibb_savepoint_rollback;
+        innobase_hton->binlog_oob_reset= innodb_reset_oob;
+        innobase_hton->binlog_oob_free= innodb_free_oob;
+        innobase_hton->binlog_write_xa_prepare_ordered=
+          ibb_write_xa_prepare_ordered;
+        innobase_hton->binlog_write_xa_prepare= ibb_write_xa_prepare;
+        innobase_hton->binlog_xa_rollback_ordered=
+          ibb_xa_rollback_ordered;
+        innobase_hton->binlog_xa_rollback= ibb_xa_rollback;
+        innobase_hton->binlog_unlog= ibb_binlog_unlog;
+        innobase_hton->get_binlog_reader= innodb_get_binlog_reader;
+        innobase_hton->get_binlog_file_list= innodb_get_binlog_file_list;
+        innobase_hton->get_filename= ibb_get_filename;
+        innobase_hton->binlog_status= innodb_binlog_status;
+        innobase_hton->binlog_flush= innodb_binlog_flush;
+        innobase_hton->binlog_get_init_state= innodb_binlog_get_init_state;
+        innobase_hton->reset_binlogs= innodb_reset_binlogs;
+        innobase_hton->binlog_purge= innodb_binlog_purge;
 
 	innodb_remember_check_sysvar_funcs();
 
@@ -4455,8 +4453,8 @@ innobase_commit_ordered(
 	DBUG_ASSERT(all ||
 		(!thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN)));
 
-	innobase_commit_ordered_2(trx, thd);
 	trx->active_commit_ordered = true;
+	innobase_commit_ordered_2(trx, thd);
 
 	DBUG_VOID_RETURN;
 }
@@ -5813,6 +5811,7 @@ ha_innobase::open(const char* name, int, uint)
 		if (int err = prepare_create_stub_for_import(thd, norm_name,
 							     create_info))
 			DBUG_RETURN(err);
+                create_info.option_struct= option_struct;
 		create(norm_name, table, &create_info, true, nullptr);
 		DEBUG_SYNC(thd, "ib_after_create_stub_for_import");
 		ib_table = open_dict_table(name, norm_name, is_part,
@@ -6206,24 +6205,21 @@ ha_innobase::close()
 /* The following accessor functions should really be inside MySQL code! */
 
 #ifdef WITH_WSREP
-ulint
-wsrep_innobase_mysql_sort(
-					/* out: str contains sort string */
+size_t
+wsrep_normalize_string(
 	int		mysql_type,	/* in: MySQL type */
 	uint		charset_number,	/* in: number of the charset */
-	unsigned char*	str,		/* in: data field */
-	ulint		str_length,	/* in: data field length,
+	const unsigned char* str,	/* in: input data field */
+	unsigned char*  out_str,        /* out: normalized string */
+	size_t		str_length,	/* in: data field length,
 					not UNIV_SQL_NULL */
-	ulint		buf_length)	/* in: total str buffer length */
+	size_t		buf_length)	/* in: total str buffer length */
 
 {
-	CHARSET_INFO*		charset;
-	enum_field_types	mysql_tp;
-	ulint			ret_length =	str_length;
+	size_t ret_length= str_length;
+	const enum_field_types mysql_tp= (enum_field_types)mysql_type;
 
 	DBUG_ASSERT(str_length != UNIV_SQL_NULL);
-
-	mysql_tp = (enum_field_types) mysql_type;
 
 	switch (mysql_tp) {
 
@@ -6236,8 +6232,7 @@ wsrep_innobase_mysql_sort(
 	case MYSQL_TYPE_LONG_BLOB:
 	case MYSQL_TYPE_VARCHAR:
 	{
-		uchar tmp_str[REC_VERSION_56_MAX_INDEX_COL_LEN] = {'\0'};
-		ulint tmp_length = REC_VERSION_56_MAX_INDEX_COL_LEN;
+		CHARSET_INFO* charset;
 
 		/* Use the charset number to pick the right charset struct for
 		the comparison. Since the MySQL function get_charset may be
@@ -6252,38 +6247,28 @@ wsrep_innobase_mysql_sort(
 			charset = get_charset(charset_number, MYF(MY_WME));
 
 			if (charset == NULL) {
-			  sql_print_error("InnoDB needs charset %lu for doing "
-					  "a comparison, but MariaDB cannot "
-					  "find that charset.",
-					  (ulong) charset_number);
+				sql_print_error("InnoDB needs charset %lu for doing "
+						"a comparison, but MariaDB cannot "
+						"find that charset.",
+						(ulong) charset_number);
 				ut_a(0);
 			}
 		}
 
-		ut_a(str_length <= tmp_length);
-		memcpy(tmp_str, str, str_length);
-
-		tmp_length = charset->strnxfrm(str, str_length,
-					       uint(str_length), tmp_str,
-					       tmp_length, 0).m_result_length;
-		DBUG_ASSERT(tmp_length <= str_length);
 		if (wsrep_protocol_version < 3) {
-			tmp_length = charset->strnxfrm(
-				str, str_length,
-				uint(str_length), tmp_str,
-				tmp_length, 0).m_result_length;
-			DBUG_ASSERT(tmp_length <= str_length);
+			ret_length = charset->strnxfrm(
+				out_str, str_length,
+				uint(str_length), str, buf_length, 0)
+				.m_result_length;
 		} else {
 			/* strnxfrm will expand the destination string,
-			   protocols < 3 truncated the sorted sring
-			   protocols >= 3 gets full sorted sring
+			   protocols < 3 truncated the normalized string
+			   protocols >= 3 gets full normalized string
 			*/
-			tmp_length = charset->strnxfrm(
-				str, buf_length,
-				uint(str_length), tmp_str,
-				str_length, 0).m_result_length;
-			DBUG_ASSERT(tmp_length <= buf_length);
-			ret_length = tmp_length;
+			ret_length = charset->strnxfrm(
+				out_str, buf_length,
+				uint(str_length), str, str_length, 0)
+				.m_result_length;
 		}
 
 		break;
@@ -6607,8 +6592,6 @@ wsrep_store_key_val_for_row(
 	KEY_PART_INFO*	key_part	= key_info->key_part;
 	KEY_PART_INFO*	end		= key_part + key_info->user_defined_key_parts;
 	char*		buff_start	= buff;
-	enum_field_types mysql_type;
-	Field*		field;
 	ulint buff_space = buff_len;
 
 	DBUG_ENTER("wsrep_store_key_val_for_row");
@@ -6617,8 +6600,8 @@ wsrep_store_key_val_for_row(
 	*key_is_null = true;
 
 	for (; key_part != end; key_part++) {
-		uchar sorted[REC_VERSION_56_MAX_INDEX_COL_LEN] = {'\0'};
-		bool part_is_null = false;
+		uchar normalized[REC_VERSION_56_MAX_INDEX_COL_LEN+1];
+		bool part_is_null= false;
 
 		if (key_part->null_bit) {
 			if (buff_space > 0) {
@@ -6638,23 +6621,15 @@ wsrep_store_key_val_for_row(
 		}
 		if (!part_is_null)  *key_is_null = false;
 
-		field = key_part->field;
-		mysql_type = field->type();
+		const Field* field= key_part->field;
+		const enum_field_types mysql_type= field->type();
 
 		if (mysql_type == MYSQL_TYPE_VARCHAR) {
 						/* >= 5.0.3 true VARCHAR */
-			ulint		lenlen;
-			ulint		len;
-			const byte*	data;
-			ulint		key_len;
-			ulint		true_len;
-			const CHARSET_INFO* cs;
-			int		error=0;
-
-			key_len = key_part->length;
+			const size_t key_len= key_part->length;
 
 			if (part_is_null) {
-				true_len = key_len + 2;
+				size_t true_len= key_len + 2;
 				if (true_len > buff_space) {
 					fprintf (stderr,
 						 "WSREP: key truncated: %s\n",
@@ -6665,27 +6640,28 @@ wsrep_store_key_val_for_row(
 				buff_space -= true_len;
 				continue;
 			}
-			cs = field->charset();
+			const CHARSET_INFO* cs = field->charset();
 
-			lenlen = (ulint)
+			ulint lenlen = (ulint)
 				(((Field_varstring*)field)->length_bytes);
 
-			data = row_mysql_read_true_varchar(&len,
+			size_t len;
+			const byte* data = row_mysql_read_true_varchar(&len,
 				(byte*) (record
 				+ (ulint)get_field_offset(table, field)),
 				lenlen);
 
-			true_len = len;
+			size_t true_len= len;
 
 			/* For multi byte character sets we need to calculate
 			the true length of the key */
 
 			if (len > 0 && cs->mbmaxlen > 1) {
-				true_len = (ulint) my_well_formed_length(cs,
+				int error;
+				true_len= my_well_formed_length(cs,
 						(const char *) data,
 						(const char *) data + len,
-						(uint) (key_len /
-						cs->mbmaxlen),
+						(key_len / cs->mbmaxlen),
 						&error);
 			}
 
@@ -6696,14 +6672,19 @@ wsrep_store_key_val_for_row(
 			}
 			/* cannot exceed max column length either, we may need to truncate
 			the stored value: */
-			if (true_len > sizeof(sorted)) {
-			  true_len = sizeof(sorted);
+			if (true_len >= sizeof(normalized)) {
+				true_len = sizeof(normalized) - 1;
 			}
 
-			memcpy(sorted, data, true_len);
-			true_len = wsrep_innobase_mysql_sort(
-				mysql_type, cs->number, sorted, true_len,
-				REC_VERSION_56_MAX_INDEX_COL_LEN);
+			/* Normalize string if is not empty string */
+			if (true_len) {
+				ut_ad(data);
+				true_len= wsrep_normalize_string(
+					mysql_type, cs->number, data,
+					normalized, true_len,
+					REC_VERSION_56_MAX_INDEX_COL_LEN);
+			}
+
 			if (wsrep_protocol_version > 1) {
 				/* Note that we always reserve the maximum possible
 				length of the true VARCHAR in the key value, though
@@ -6716,7 +6697,7 @@ wsrep_store_key_val_for_row(
 						 wsrep_thd_query(thd));
 					true_len = buff_space;
 				}
- 				memcpy(buff, sorted, true_len);
+				memcpy(buff, normalized, true_len);
 				buff += true_len;
 				buff_space -= true_len;
 			} else {
@@ -6730,19 +6711,11 @@ wsrep_store_key_val_for_row(
 			as BLOB data in innodb. */
 			|| mysql_type == MYSQL_TYPE_GEOMETRY) {
 
-			const CHARSET_INFO* cs;
-			ulint		key_len;
-			ulint		true_len;
-			int		error=0;
-			ulint		blob_len;
-			const byte*	blob_data;
-
+			const size_t key_len= key_part->length;
 			ut_a(key_part->key_part_flag & HA_PART_KEY_SEG);
 
-			key_len = key_part->length;
-
 			if (part_is_null) {
-				true_len = key_len + 2;
+				size_t true_len= key_len + 2;
 				if (true_len > buff_space) {
 					fprintf (stderr,
 						 "WSREP: key truncated: %s\n",
@@ -6755,14 +6728,15 @@ wsrep_store_key_val_for_row(
 				continue;
 			}
 
-			cs = field->charset();
+			const CHARSET_INFO* cs= field->charset();
 
-			blob_data = row_mysql_read_blob_ref(&blob_len,
+			size_t blob_len;
+			const byte* blob_data = row_mysql_read_blob_ref(&blob_len,
 				(byte*) (record
 				+ (ulint)get_field_offset(table, field)),
 					(ulint) field->pack_length());
 
-			true_len = blob_len;
+			size_t true_len= blob_len;
 
 			ut_a(get_field_offset(table, field)
 				== key_part->offset);
@@ -6771,12 +6745,13 @@ wsrep_store_key_val_for_row(
 			the true length of the key */
 
 			if (blob_len > 0 && cs->mbmaxlen > 1) {
-				true_len = (ulint) my_well_formed_length(cs,
+				int error;
+
+				true_len= my_well_formed_length(cs,
 						(const char *) blob_data,
 						(const char *) blob_data
 							+ blob_len,
-						(uint) (key_len /
-							cs->mbmaxlen),
+						(key_len / cs->mbmaxlen),
 						&error);
 			}
 
@@ -6788,11 +6763,16 @@ wsrep_store_key_val_for_row(
 				true_len = key_len;
 			}
 
-			memcpy(sorted, blob_data, true_len);
-			true_len = wsrep_innobase_mysql_sort(
-				mysql_type, cs->number, sorted, true_len,
-				REC_VERSION_56_MAX_INDEX_COL_LEN);
-
+			/* Normalize string if it is not empty string.
+			When true_len == 0 blob_data is not always
+			nullptr it may be empty string i.e. "" */
+			if (true_len) {
+				ut_ad(blob_data);
+				true_len= wsrep_normalize_string(
+					mysql_type, cs->number, blob_data,
+					normalized, true_len,
+					REC_VERSION_56_MAX_INDEX_COL_LEN);
+			}
 
 			/* Note that we always reserve the maximum possible
 			length of the BLOB prefix in the key value. */
@@ -6803,29 +6783,20 @@ wsrep_store_key_val_for_row(
 						 wsrep_thd_query(thd));
 					true_len = buff_space;
 				}
+				memcpy(buff, normalized, true_len);
 				buff       += true_len;
 				buff_space -= true_len;
 			} else {
 				buff += key_len;
 			}
-			memcpy(buff, sorted, true_len);
 		} else {
 			/* Here we handle all other data types except the
 			true VARCHAR, BLOB and TEXT. Note that the column
 			value we store may be also in a column prefix
 			index. */
 
-			const CHARSET_INFO*	cs = NULL;
-			ulint			true_len;
-			ulint			key_len;
-			const uchar*		src_start;
-			int			error=0;
-			enum_field_types	real_type;
-
-			key_len = key_part->length;
-
 			if (part_is_null) {
-				true_len = key_len;
+				size_t true_len= key_part->length;
 				if (true_len > buff_space) {
 					fprintf (stderr,
 						 "WSREP: key truncated: %s\n",
@@ -6838,9 +6809,9 @@ wsrep_store_key_val_for_row(
 				continue;
 			}
 
-			src_start = record + key_part->offset;
-			real_type = field->real_type();
-			true_len = key_len;
+			const uchar* src_start= record + key_part->offset;
+			const enum_field_types real_type= field->real_type();
+			size_t true_len= key_part->length;
 
 			/* Character set for the field is defined only
 			to fields whose type is string and real field
@@ -6852,26 +6823,32 @@ wsrep_store_key_val_for_row(
 				&& ( mysql_type == MYSQL_TYPE_VAR_STRING
 					|| mysql_type == MYSQL_TYPE_STRING)) {
 
-				cs = field->charset();
+				const CHARSET_INFO* cs= field->charset();
 
 				/* For multi byte character sets we need to
 				calculate the true length of the key */
 
-				if (key_len > 0 && cs->mbmaxlen > 1) {
+				if (true_len > 0 && cs->mbmaxlen > 1) {
+					int error;
 
-					true_len = (ulint)
-						my_well_formed_length(cs,
+					true_len= my_well_formed_length(cs,
 							(const char *)src_start,
 							(const char *)src_start
-								+ key_len,
-							(uint) (key_len /
-								cs->mbmaxlen),
+								+ true_len,
+							(true_len / cs->mbmaxlen),
 							&error);
 				}
-				memcpy(sorted, src_start, true_len);
-				true_len = wsrep_innobase_mysql_sort(
-					mysql_type, cs->number, sorted, true_len,
-					REC_VERSION_56_MAX_INDEX_COL_LEN);
+
+				/* Normalize string if it is not empty string */
+				if (true_len) {
+					ut_ad(src_start);
+					true_len= wsrep_normalize_string(
+						mysql_type, cs->number,
+						src_start, normalized, true_len,
+						REC_VERSION_56_MAX_INDEX_COL_LEN);
+				} else {
+					ut_ad(src_start == nullptr);
+				}
 
 				if (true_len > buff_space) {
 					fprintf (stderr,
@@ -6879,9 +6856,15 @@ wsrep_store_key_val_for_row(
 						 wsrep_thd_query(thd));
 					true_len   = buff_space;
 				}
-				memcpy(buff, sorted, true_len);
+				memcpy(buff, normalized, true_len);
 			} else {
-				memcpy(buff, src_start, true_len);
+				/* Copy only if there is data */
+				if (true_len) {
+					ut_ad(src_start);
+					memcpy(buff, src_start, true_len);
+				} else {
+					ut_ad(src_start == nullptr);
+				}
 			}
 			buff       += true_len;
 			buff_space -= true_len;
@@ -8429,12 +8412,15 @@ wsrep_calc_row_hash(
 	return(0);
 }
 
-/** Append table-level exclusive key.
+/** Append table-level exclusive/shared key.
 @param thd   MySQL thread handle
 @param table table
+@param exclusive Exclusive not shared certification key.
 @retval false on success
 @retval true on failure */
-ATTRIBUTE_COLD bool wsrep_append_table_key(MYSQL_THD thd, const dict_table_t &table)
+ATTRIBUTE_COLD bool wsrep_append_table_key(MYSQL_THD thd,
+                                           const dict_table_t &table,
+                                           bool exclusive)
 {
   char db_buf[NAME_LEN + 1];
   char tbl_buf[NAME_LEN + 1];
@@ -8447,9 +8433,11 @@ ATTRIBUTE_COLD bool wsrep_append_table_key(MYSQL_THD thd, const dict_table_t &ta
     return true;
   }
 
-  /* Append table-level exclusive key */
-  const int rcode = wsrep_thd_append_table_key(thd, db_buf,
-                                               tbl_buf, WSREP_SERVICE_KEY_EXCLUSIVE);
+  /* Append table-level key */
+  const enum Wsrep_service_key_type key_type = exclusive
+                                               ? WSREP_SERVICE_KEY_EXCLUSIVE
+                                               : WSREP_SERVICE_KEY_SHARED;
+  const int rcode = wsrep_thd_append_table_key(thd, db_buf, tbl_buf, key_type);
   if (rcode)
   {
     WSREP_ERROR("Appending table key failed: %s, %d",
@@ -8614,10 +8602,10 @@ func_exit:
 	    && (thd_sql_command(m_user_thd) != SQLCOM_LOAD ||
 	        thd_binlog_format(m_user_thd) == BINLOG_FORMAT_ROW)) {
 
-		/* We use table-level exclusive key for SEQUENCES
+		/* We use table-level shared key for SEQUENCES
 		   and normal key append for others. */
 		if (table->s->table_type == TABLE_TYPE_SEQUENCE) {
-			if (wsrep_append_table_key(m_user_thd, *m_prebuilt->table))
+			if (wsrep_append_table_key(m_user_thd, *m_prebuilt->table, false))
 				DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
 		} else if (wsrep_append_keys(m_user_thd,
 					     wsrep_protocol_version >= 4
@@ -9534,18 +9522,6 @@ ha_innobase::ft_init_ext(
 	const CHARSET_INFO*	char_set = key->charset();
 	const char*		query = key->ptr();
 
-	if (UNIV_UNLIKELY(fts_enable_diag_print)) {
-		{
-			ib::info	out;
-			out << "keynr=" << keynr << ", '";
-			out.write(key->ptr(), key->length());
-		}
-
-		sql_print_information((flags & FT_BOOL)
-				      ? "InnoDB: BOOL search"
-				      : "InnoDB: NL search");
-	}
-
         /* Multi byte character sets like utf32 and utf16 are not
            compatible with some string function used. So to convert them
            to uft8 before we proceed. */
@@ -9750,15 +9726,6 @@ next_record:
 		/* If we only need information from result we can return
 		   without fetching the table row */
 		if (ft_prebuilt->read_just_key) {
-#ifdef MYSQL_STORE_FTS_DOC_ID
-			if (m_prebuilt->fts_doc_id_in_read_set) {
-				fts_ranking_t* ranking;
-				ranking = rbt_value(fts_ranking_t,
-						    result->current);
-				innobase_fts_store_docid(
-					table, ranking->doc_id);
-			}
-#endif
 			table->status= 0;
 			return(0);
 		}
@@ -10565,7 +10532,7 @@ create_table_info_t::create_table_def()
 	ulint		doc_id_col = 0;
 	ibool		has_doc_id_col = FALSE;
 	mem_heap_t*	heap;
-	ha_table_option_struct *options= m_form->s->option_struct;
+	ha_table_option_struct *options= m_create_info->option_struct;
 	dberr_t		err = DB_SUCCESS;
 
 	DBUG_ENTER("create_table_def");
@@ -10885,6 +10852,7 @@ create_index(
 	trx_t*		trx,		/*!< in: InnoDB transaction handle */
 	const TABLE*	form,		/*!< in: information on table
 					columns and indexes */
+        const ha_table_option_struct& o,
 	dict_table_t*	table,		/*!< in,out: table */
 	uint		key_num)	/*!< in: index number */
 {
@@ -10899,7 +10867,6 @@ create_index(
 
 	/* Assert that "GEN_CLUST_INDEX" cannot be used as non-primary index */
 	ut_a(!key->name.streq(GEN_CLUST_INDEX));
-	const ha_table_option_struct& o = *form->s->option_struct;
 
 	if (key->algorithm == HA_KEY_ALG_FULLTEXT ||
 	    key->algorithm == HA_KEY_ALG_RTREE) {
@@ -11259,7 +11226,7 @@ const char*
 create_table_info_t::check_table_options()
 {
 	enum row_type row_format = m_create_info->row_type;
-	const ha_table_option_struct *options= m_form->s->option_struct;
+        const ha_table_option_struct *options= m_create_info->option_struct;
 
 	switch (options->encryption) {
 	case FIL_ENCRYPTION_OFF:
@@ -11549,7 +11516,7 @@ bool create_table_info_t::innobase_table_flags()
 		ut_min(static_cast<ulint>(UNIV_PAGE_SSIZE_MAX),
 		       static_cast<ulint>(PAGE_ZIP_SSIZE_MAX));
 
-	ha_table_option_struct *options= m_form->s->option_struct;
+        ha_table_option_struct *options= m_create_info->option_struct;
 
 	m_flags = 0;
 	m_flags2 = 0;
@@ -12740,6 +12707,7 @@ int create_table_info_t::create_table(bool create_fk, bool strict)
 	int		error;
 	int		primary_key_no;
 	uint		i;
+        const ha_table_option_struct& o = *m_create_info->option_struct;
 
 	DBUG_ENTER("create_table");
 
@@ -12767,7 +12735,6 @@ int create_table_info_t::create_table(bool create_fk, bool strict)
 		dict_index_t* index = dict_mem_index_create(
 			m_table, GEN_CLUST_INDEX.str,
 			DICT_CLUSTERED, 0);
-		const ha_table_option_struct& o = *m_form->s->option_struct;
 		error = convert_error_code_to_mysql(
 			row_create_index_for_mysql(
 				index, m_trx, NULL,
@@ -12782,7 +12749,7 @@ int create_table_info_t::create_table(bool create_fk, bool strict)
 	if (primary_key_no != -1) {
 		/* In InnoDB the clustered index must always be created
 		first */
-		if ((error = create_index(m_trx, m_form, m_table,
+		if ((error = create_index(m_trx, m_form, o, m_table,
 					  (uint) primary_key_no))) {
 			DBUG_RETURN(error);
 		}
@@ -12839,7 +12806,7 @@ int create_table_info_t::create_table(bool create_fk, bool strict)
 
 	for (i = 0; i < m_form->s->keys; i++) {
 		if (i != uint(primary_key_no)
-		    && (error = create_index(m_trx, m_form, m_table, i))) {
+		    && (error = create_index(m_trx, m_form, o, m_table, i))) {
 			DBUG_RETURN(error);
 		}
 	}
@@ -13233,6 +13200,7 @@ ha_innobase::create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
   DBUG_ASSERT(table_share->table_type == TABLE_TYPE_SEQUENCE ||
               table_share->table_type == TABLE_TYPE_NORMAL);
 
+  DBUG_ASSERT(option_struct == create_info->option_struct);
   create_table_info_t info(ha_thd(), form, create_info, file_per_table, trx);
 
   int error= info.initialize();
@@ -13292,7 +13260,7 @@ ha_innobase::create(const char *name, TABLE *form, HA_CREATE_INFO *create_info,
           log_write_up_to(trx->commit_lsn, true);
         info.table()->release();
       }
-      trx->free();
+      trx->clear_and_free();
     }
   }
   else if (!error && m_prebuilt)
@@ -13737,6 +13705,7 @@ err_exit:
   for (pfs_os_file_t d : deleted)
     os_file_close(d);
   log_write_up_to(trx->commit_lsn, true);
+  trx->commit_lsn= 0;
   if (trx != parent_trx)
     trx->free();
   if (!fts)
@@ -13851,6 +13820,7 @@ int ha_innobase::truncate()
     info.row_type= ROW_TYPE_DYNAMIC;
     break;
   }
+  info.option_struct= option_struct;
 
   const auto stored_lock= m_prebuilt->stored_select_lock_type;
   trx_t *trx= innobase_trx_allocate(m_user_thd);
@@ -13881,7 +13851,7 @@ int ha_innobase::truncate()
       m_prebuilt->stored_select_lock_type= stored_lock;
     }
 
-    trx->free();
+    trx->clear_and_free();
 
 #ifdef BTR_CUR_HASH_ADAPT
     if (UT_LIST_GET_LEN(ib_table->freed_indexes))
@@ -14044,7 +14014,7 @@ int ha_innobase::truncate()
     }
   }
 
-  trx->free();
+  trx->clear_and_free();
   if (!stats_failed)
     stats.close();
   mem_heap_free(heap);
@@ -14244,7 +14214,7 @@ ha_innobase::rename_table(
 		log_write_up_to(trx->commit_lsn, true);
 	}
 	trx->flush_log_later = false;
-	trx->free();
+	trx->clear_and_free();
 	if (!stats_fail) {
 		stats.close();
 	}
@@ -15013,6 +14983,30 @@ stats_fetch:
 			}
 
 			KEY*	key = &table->key_info[i];
+			/*
+			  Provide statistics about how many bytes an index record takes on disk,
+			  on average.
+			*/
+			if (ib_table->stat_n_rows &&
+				key->algorithm != HA_KEY_ALG_FULLTEXT &&
+				key->algorithm != HA_KEY_ALG_RTREE) {
+				/*
+				  Start with total space used by the index divided by number of rows
+				*/
+				key->stat_storage_length = (size_t) ((index->stat_index_size * srv_page_size) /
+					ib_table->stat_n_rows);
+
+				/*
+					The above can be too large
+					A) in case of tables with very few rows
+					B) in case of indexes with partially full pages.
+					So, clip the above estimate by a conservative estimate we've used
+					before:
+				*/
+				size_t conservative_estimate = table->key_storage_length_from_ddl(i);
+				if (key->stat_storage_length > conservative_estimate)
+					key->stat_storage_length = conservative_estimate;
+			}
 
 			for (j = 0; j < key->ext_key_parts; j++) {
 
@@ -15989,10 +15983,12 @@ ha_innobase::extra(
 		alter_stats_rebuild(m_prebuilt->table, trx);
 		break;
 	case HA_EXTRA_ABORT_ALTER_COPY:
-		if (m_prebuilt->table->skip_alter_undo) {
+		if (m_prebuilt->table->skip_alter_undo &&
+		    !m_prebuilt->table->is_temporary()) {
 			trx = check_trx_exists(ha_thd());
 			m_prebuilt->table->skip_alter_undo = 0;
 			trx->rollback();
+			return(HA_ERR_ROLLBACK);
 		}
 		break;
 	default:/* Do nothing */
@@ -16654,7 +16650,7 @@ ha_innobase::store_lock(
 
 	DBUG_ASSERT(EQ_CURRENT_THD(thd));
 	const bool in_lock_tables = thd_in_lock_tables(thd);
-	const int sql_command = thd_sql_command(thd);
+	const enum enum_sql_command sql_command = thd_sql_command(thd);
 
 	if (srv_read_only_mode
 	    && (sql_command == SQLCOM_UPDATE
@@ -16708,25 +16704,21 @@ ha_innobase::store_lock(
 
 	/* Check for LOCK TABLE t1,...,tn WITH SHARED LOCKS */
 	} else if ((lock_type == TL_READ && in_lock_tables)
-		   || (lock_type == TL_READ_HIGH_PRIORITY && in_lock_tables)
 		   || lock_type == TL_READ_WITH_SHARED_LOCKS
 		   || lock_type == TL_READ_SKIP_LOCKED
 		   || lock_type == TL_READ_NO_INSERT
-		   || (lock_type != TL_IGNORE
-		       && sql_command != SQLCOM_SELECT)) {
+		   || (lock_type != TL_IGNORE && is_update_query(sql_command))) {
 
 		/* The OR cases above are in this order:
-		1) MySQL is doing LOCK TABLES ... READ LOCAL, or we
-		are processing a stored procedure or function, or
-		2) (we do not know when TL_READ_HIGH_PRIORITY is used), or
-		3) this is a SELECT ... IN SHARE MODE, or
-		4) this is a SELECT ... IN SHARE MODE SKIP LOCKED, or
-		5) we are doing a complex SQL statement like
+		1) MySQL is doing LOCK TABLES ... READ LOCAL, or
+		2) this is a SELECT ... IN SHARE MODE, or
+		3) this is a SELECT ... IN SHARE MODE SKIP LOCKED, or
+		4) we are doing a complex SQL statement like
 		INSERT INTO ... SELECT ... and the logical logging (MySQL
 		binlog) requires the use of a locking read, or
 		MySQL is doing LOCK TABLES ... READ.
-		6) we let InnoDB do locking reads for all SQL statements that
-		are not simple SELECTs; note that select_lock_type in this
+		5) we let InnoDB do locking reads for all SQL statements that
+		may modify data; note that select_lock_type in this
 		case may get strengthened in ::external_lock() to LOCK_X.
 		Note that we MUST use a locking read in all data modifying
 		SQL statements, because otherwise the execution would not be
@@ -17272,7 +17264,10 @@ innobase_xa_prepare(
   case TRX_STATE_ACTIVE:
     trx->xid= *thd->get_xid();
     if (prepare_trx)
+    {
       trx_prepare_for_mysql(trx);
+      trx->active_prepare= true;
+    }
     else
     {
       lock_unlock_table_autoinc(trx);
@@ -17322,7 +17317,6 @@ innobase_commit_by_xid(
 		innobase_commit_low(trx);
 		ut_ad(trx->mysql_thd == NULL);
 		trx_deregister_from_2pc(trx);
-		ut_ad(!trx->will_lock);    /* trx cache requirement */
 		trx->free();
 
 		return(XA_OK);
@@ -17416,7 +17410,7 @@ ha_innobase::check_if_incompatible_data(
 
 	/* Cache engine specific options */
 	param_new = info->option_struct;
-	param_old = table->s->option_struct;
+	param_old = option_struct;
 
 	m_prebuilt->table->stats_mutex_lock();
 	if (!m_prebuilt->table->stat_initialized()) {
@@ -19426,9 +19420,11 @@ static MYSQL_SYSVAR_UINT(fill_factor, innobase_fill_factor,
   "Percentage of B-tree page filled during bulk insert",
   NULL, NULL, 100, 10, 100, 0);
 
+static char fts_enable_diag_print;
+
 static MYSQL_SYSVAR_BOOL(ft_enable_diag_print, fts_enable_diag_print,
-  PLUGIN_VAR_OPCMDARG,
-  "Whether to enable additional FTS diagnostic printout",
+  PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_DEPRECATED,
+  "Deprecated parameter with no effect",
   NULL, NULL, FALSE);
 
 static MYSQL_SYSVAR_BOOL(disable_sort_file_cache, srv_disable_sort_file_cache,
@@ -19969,6 +19965,15 @@ static MYSQL_SYSVAR_BOOL(truncate_temporary_tablespace_now,
   "Shrink the temporary tablespace",
   NULL, innodb_trunc_temp_space_update, false);
 
+static MYSQL_SYSVAR_ULONGLONG(binlog_state_interval,
+  innodb_binlog_state_interval,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+  "Interval (in bytes) at which to write the GTID binlog state to binlog "
+  "files to speed up GTID lookups. Must be a power-of-two multiple of the "
+  "binlog page size (16384 bytes)",
+  NULL, NULL, 2*1024*1024,
+  32768, ULONGLONG_MAX, 0);
+
 static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(autoextend_increment),
   MYSQL_SYSVAR(buffer_pool_size),
@@ -20145,6 +20150,7 @@ static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(background_thread),
   MYSQL_SYSVAR(encrypt_temporary_tables),
   MYSQL_SYSVAR(truncate_temporary_tablespace_now),
+  MYSQL_SYSVAR(binlog_state_interval),
 
   NULL
 };

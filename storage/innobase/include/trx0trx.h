@@ -830,6 +830,8 @@ public:
 					rollback. */
 	/** whether this is holding the prepare mutex */
 	bool		active_commit_ordered;
+	/** whether innobase_xa_prepare() was done. */
+	bool		active_prepare;
 	/*------------------------------*/
 	bool		flush_log_later;/* In 2PC, we hold the
 					prepare_commit mutex across
@@ -1101,8 +1103,10 @@ public:
   bool has_stats_table_lock() const;
 
   /** Free the memory to trx_pools */
-  void free();
+  void free() noexcept;
 
+  /** Clear commit_lsn and free the memory */
+  void clear_and_free() noexcept { ut_d(commit_lsn= 0;) free(); }
 
   void assert_freed() const
   {

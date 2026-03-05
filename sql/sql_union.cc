@@ -471,8 +471,8 @@ int select_unit::update_counter(Field* counter, longlong value)
 */
 
 bool select_unit_ext::disable_index_if_needed(SELECT_LEX *curr_sl)
-{ 
-  const bool oracle_mode= thd->variables.sql_mode & MODE_ORACLE;
+{
+  const bool oracle_mode= (thd->variables.sql_mode & IS_OR_WAS_ORACLE);
   if (is_index_enabled && 
       ((!oracle_mode &&
         curr_sl == curr_sl->master_unit()->union_distinct) ||
@@ -489,7 +489,7 @@ bool select_unit_ext::disable_index_if_needed(SELECT_LEX *curr_sl)
     table->no_keyread=1;
     /* In case of Oracle mode we unfold at the last operator */
     DBUG_ASSERT(!oracle_mode || !curr_sl->next_select());
-    return oracle_mode || !curr_sl->distinct;
+    return !curr_sl->distinct;
   }
   return false;
 }
@@ -2094,7 +2094,7 @@ void st_select_lex_unit::optimize_bag_operation(bool is_outer_distinct)
       PREPARE ... FROM
       recursive
   */
-  if ((thd->variables.sql_mode & MODE_ORACLE) ||
+  if ((thd->variables.sql_mode & IS_OR_WAS_ORACLE) ||
     (thd->lex->context_analysis_only & CONTEXT_ANALYSIS_ONLY_VIEW) ||
     (fake_select_lex != NULL && thd->stmt_arena->is_stmt_prepare()) ||
     (with_element && with_element->is_recursive ))
@@ -2518,11 +2518,6 @@ bool st_select_lex_unit::exec_inner()
           Stop execution of the remaining queries in the UNIONS, and produce
           the current result.
         */
-        push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
-                            ER_QUERY_RESULT_INCOMPLETE,
-                            ER_THD(thd, ER_QUERY_RESULT_INCOMPLETE),
-                            "LIMIT ROWS EXAMINED",
-                            thd->lex->limit_rows_examined->val_uint());
         thd->reset_killed();
         break;
       }
@@ -2954,7 +2949,12 @@ bool st_select_lex::cleanup()
 
   cleanup_window_funcs(window_funcs);
 
-  if (join)
+  /*
+    In UPDATE/DELETE, it can be that leaf_tables has tables while the JOIN
+    object is not created yet (and then some error occurs and we get here).
+    In leaf_tables, recursive CTE references need cleanup.
+  */
+  if (leaf_tables.elements)
   {
     List_iterator<TABLE_LIST> ti(leaf_tables);
     TABLE_LIST *tbl;
@@ -2971,8 +2971,12 @@ bool st_select_lex::cleanup()
         error|= (bool) error | (uint) unit->cleanup();
       }
     }
+  }
+
+  if (join)
+  {
     DBUG_ASSERT((st_select_lex*)join->select_lex == this);
-    error= join->destroy();
+    error|= (bool)join->destroy();
     delete join;
     join= 0;
   }

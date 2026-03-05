@@ -672,25 +672,9 @@ bool wsrep_is_BF_lock_timeout(const trx_t &trx)
              << " error: " << trx.error_state
              << " query: " << wsrep_thd_query(trx.mysql_thd);
 
-  if (const lock_t*wait_lock = trx.lock.wait_lock)
-  {
-    const my_hrtime_t now= my_hrtime_coarse();
-    const my_hrtime_t suspend_time= trx.lock.suspend_time;
-    fprintf(stderr,
-            "------- TRX HAS BEEN WAITING %llu us"
-            " FOR THIS LOCK TO BE GRANTED:\n",
-            now.val - suspend_time.val);
-
-    if (!wait_lock->is_table()) {
-      mtr_t mtr{nullptr};
-      lock_rec_print(stderr, wait_lock, mtr);
-    } else {
-      lock_table_print(stderr, wait_lock);
-    }
-
-    fprintf(stderr, "------------------\n");
-  }
-
+  // TODO: Can't use lock_rec_print from here because
+  // record lock page might not be latched and we are
+  // actually only interested lock information.
   return true;
 }
 
@@ -7182,6 +7166,7 @@ and less modified rows. Bit 0 is used to prefer orig_trx in case of a tie.
     static const char rollback_msg[]= "*** WE ROLL BACK TRANSACTION (%u)\n";
     char buf[9 + sizeof rollback_msg];
     trx_t *victim= nullptr;
+    char *deadlock_info= nullptr;
 
     /* Here, lock elision does not make sense, because
     for the output we are going to invoke system calls,
@@ -7314,11 +7299,37 @@ and less modified rows. Bit 0 is used to prefer orig_trx in case of a tie.
       victim->lock.was_chosen_as_deadlock_victim= true;
       DEBUG_SYNC_C("deadlock_report_before_lock_releasing");
       lock_cancel_waiting_and_release<true>(victim->lock.wait_lock);
+
+      if (!current_trx || victim != trx || !trx->mysql_thd ||
+          !srv_print_all_deadlocks)
+        goto func_exit;
+      fflush(lock_latest_err_file);
+      long len= ftell(lock_latest_err_file);
+      if (len <= 0)
+        goto func_exit;
+      deadlock_info= static_cast<char*>(ut_malloc_nokey(size_t(len) + 1));
+      if (!deadlock_info)
+        goto func_exit;
+      rewind(lock_latest_err_file);
+      size_t deadlock_info_len=
+        fread(deadlock_info, 1, size_t(len), lock_latest_err_file);
+      ut_ad(deadlock_info_len <= size_t(len));
+      if (deadlock_info_len && deadlock_info[deadlock_info_len - 1] == '\n')
+        --deadlock_info_len;
+      deadlock_info[deadlock_info_len]= '\0';
     }
 
 func_exit:
     if (current_trx)
       lock_sys.wr_unlock();
+
+    if (deadlock_info)
+    {
+      push_warning(trx->mysql_thd, Sql_condition::WARN_LEVEL_NOTE,
+                   ER_LOCK_DEADLOCK, deadlock_info);
+      ut_free(deadlock_info);
+    }
+
     return victim;
   }
 }

@@ -57,7 +57,7 @@ SET(SQL_EMBEDDED_SOURCES emb_qcache.cc libmysqld.c lib_sql.cc
            ../sql/field.cc ../sql/field_conv.cc ../sql/field_comp.cc
            ../sql/filesort_utils.cc ../sql/sql_digest.cc
            ../sql/filesort.cc ../sql/grant.cc
-           ../sql/gstream.cc ../sql/slave.cc
+           ../sql/gstream.cc
            ../sql/signal_handler.cc
            ../sql/handler.cc ../sql/hash_filo.cc ../sql/hostname.cc 
            ../sql/init.cc ../sql/item_buff.cc ../sql/item_cmpfunc.cc 
@@ -79,7 +79,7 @@ SET(SQL_EMBEDDED_SOURCES emb_qcache.cc libmysqld.c lib_sql.cc
            ../sql/opt_vcol_substitution.cc
            ../sql/parse_file.cc ../sql/procedure.cc ../sql/protocol.cc 
            ../sql/records.cc ../sql/repl_failsafe.cc ../sql/rpl_filter.cc
-           ../sql/rpl_record.cc ../sql/des_key_file.cc
+           ../sql/rpl_record.cc
            ../sql/rpl_injector.cc ../sql/set_var.cc ../sql/spatial.cc 
            ../sql/sp_cache.cc ../sql/sp.cc ../sql/sp_head.cc 
            ../sql/sp_pcontext.cc ../sql/sp_rcontext.cc ../sql/sql_acl.cc 
@@ -165,6 +165,7 @@ SET(SQL_EMBEDDED_SOURCES emb_qcache.cc libmysqld.c lib_sql.cc
            ../sql/scan_char.h
            ../sql/opt_hints.cc ../sql/opt_hints.h
 	   ../sql/opt_trace_ddl_info.cc ../sql/opt_trace_ddl_info.h
+           ../sql/sql_path.cc
            ${GEN_SOURCES}
            ${MYSYS_LIBWRAP_SOURCE}
 )

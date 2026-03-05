@@ -225,6 +225,9 @@ create_federatedx_select_handler(THD *thd, SELECT_LEX *sel_lex,
   if (!use_pushdown || !is_supported_by_select_handler(thd->lex->sql_command))
     return nullptr;
 
+  if (lex_unit && sel_lex->master_unit()->with_clause)
+    return nullptr;
+
   auto tbl= get_fed_table_for_pushdown(sel_lex);
   if (!tbl)
     return nullptr;
@@ -321,7 +324,8 @@ int federatedx_handler_base::init_scan_()
 
   ha_federatedx *h= (ha_federatedx *) query_table->file;
   iop= &h->io;
-  share= get_share(query_table->s->table_name.str, query_table);
+  share= get_share(query_table->s->table_name.str, query_table,
+                   h->option_struct);
   txn= h->get_txn(thd);
   if ((rc= txn->acquire(share, thd, TRUE, iop)))
     DBUG_RETURN(rc);

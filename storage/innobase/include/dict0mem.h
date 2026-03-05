@@ -2297,7 +2297,7 @@ public:
 
 	/** Column names packed in a character string
 	"name1\0name2\0...nameN\0". Until the string contains n_cols, it will
-	be allocated from a temporary heap. The final string will be allocated
+	be allocated from a temporary heap. The override final string will be allocated
 	from table->heap. */
 	const char*				col_names;
 
@@ -2336,11 +2336,6 @@ public:
 
 	/** Node of the LRU list of tables. */
 	UT_LIST_NODE_T(dict_table_t)		table_LRU;
-
-	/** Maximum recursive level we support when loading tables chained
-	together with FK constraints. If exceeds this level, we will stop
-	loading child table into memory along with its parent table. */
-	byte					fk_max_recusive_level;
 
   /** DDL transaction that last touched the table definition, or 0 if
   no history is available. This includes possible changes in

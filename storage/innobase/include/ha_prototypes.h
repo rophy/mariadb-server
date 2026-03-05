@@ -46,7 +46,6 @@ typedef struct mem_block_info_t mem_heap_t;
 // JAN: TODO missing features:
 #undef MYSQL_FT_INIT_EXT
 #undef MYSQL_PFS
-#undef MYSQL_STORE_FTS_DOC_ID
 
 /*******************************************************************//**
 Formats the raw data in "data" (in InnoDB on-disk format) that is of
@@ -160,9 +159,12 @@ innobase_convert_from_id(
 				should be at least 3 * strlen(to) + 1 */
 
 #ifdef WITH_WSREP
-ulint wsrep_innobase_mysql_sort(int mysql_type, uint charset_number,
-                             unsigned char* str, ulint str_length,
-                             ulint buf_length);
+size_t wsrep_normalize_string(int mysql_type,
+			      uint charset_number,
+			      const unsigned char* str,
+			      unsigned char* out_str,
+			      ulint str_length,
+			      ulint buf_length);
 #endif /* WITH_WSREP */
 
 /** Get high resolution timestamp for the current query start time.
@@ -403,13 +405,15 @@ char *dict_table_lookup(LEX_CSTRING db, LEX_CSTRING name,
                         dict_table_t **table, mem_heap_t *heap) noexcept;
 
 #ifdef WITH_WSREP
-/** Append table-level exclusive key.
+/** Append table-level exclusive/shared key.
 @param thd   MySQL thread handle
 @param table table
+@param exclusive Exclusive not shared certification key.
 @retval false on success
 @retval true on failure */
 struct dict_table_t;
-bool wsrep_append_table_key(MYSQL_THD thd, const dict_table_t &table);
+bool wsrep_append_table_key(MYSQL_THD thd, const dict_table_t &table,
+                            bool exclusive);
 #endif /* WITH_WSREP */
 
 #endif /* !UNIV_INNOCHECKSUM */
