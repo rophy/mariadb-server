@@ -1,0 +1,13 @@
+---
+# Test ServiceAccounts representing users that authenticate to MariaDB
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: user1
+  namespace: mariadb-auth-test
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: user2
+  namespace: mariadb-auth-test

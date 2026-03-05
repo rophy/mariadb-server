@@ -1,0 +1,16 @@
+SELECT PLUGIN_NAME, PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS
+WHERE PLUGIN_NAME = 'auth_k8s';
+PLUGIN_NAME	PLUGIN_STATUS
+auth_k8s	ACTIVE
+CREATE USER 'mariadb-auth-test/user1' IDENTIFIED WITH auth_k8s;
+GRANT ALL ON *.* TO 'mariadb-auth-test/user1';
+SELECT USER(), CURRENT_USER();
+USER()	CURRENT_USER()
+mariadb-auth-test/user1@localhost	mariadb-auth-test/user1@%
+disconnect con_user1;
+connection default;
+CREATE USER 'mariadb-auth-test/wronguser' IDENTIFIED WITH auth_k8s;
+ERROR 28000: Access denied for user 'mariadb-auth-test/wronguser'@'localhost' (using password: YES)
+connection default;
+DROP USER 'mariadb-auth-test/user1';
+DROP USER 'mariadb-auth-test/wronguser';

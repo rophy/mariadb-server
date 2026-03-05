@@ -1,0 +1,48 @@
+--source include/not_embedded.inc
+
+#
+# Verify plugin is loaded
+#
+SELECT PLUGIN_NAME, PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS
+  WHERE PLUGIN_NAME = 'auth_k8s';
+
+#
+# Test 1: Successful authentication with user1
+#
+CREATE USER 'mariadb-auth-test/user1' IDENTIFIED WITH auth_k8s;
+GRANT ALL ON *.* TO 'mariadb-auth-test/user1';
+
+# Generate a fresh SA token for user1
+--let $token_cmd= kubectl create token user1 -n mariadb-auth-test --duration=30m 2>/dev/null
+--exec $token_cmd > $MYSQLTEST_VARDIR/tmp/user1_token
+
+# Read token into variable
+--let $user1_token= `SELECT LOAD_FILE('$MYSQLTEST_VARDIR/tmp/user1_token')`
+
+# Connect using the token as password
+--disable_query_log
+--connect (con_user1, localhost, mariadb-auth-test/user1, $user1_token,,,,auth=mysql_clear_password:mysql_native_password)
+--enable_query_log
+SELECT USER(), CURRENT_USER();
+--disconnect con_user1
+--connection default
+
+#
+# Test 2: Authentication failure with wrong user
+#
+CREATE USER 'mariadb-auth-test/wronguser' IDENTIFIED WITH auth_k8s;
+
+# Use user1's token but try to auth as wronguser
+--disable_query_log
+--replace_result $MASTER_MYSOCK MASTER_MYSOCK $MASTER_MYPORT MASTER_MYPORT
+--error ER_ACCESS_DENIED_ERROR
+--connect (con_wrong, localhost, mariadb-auth-test/wronguser, $user1_token,,,,auth=mysql_clear_password:mysql_native_password)
+--enable_query_log
+
+#
+# Cleanup
+#
+--connection default
+DROP USER 'mariadb-auth-test/user1';
+DROP USER 'mariadb-auth-test/wronguser';
+--remove_file $MYSQLTEST_VARDIR/tmp/user1_token

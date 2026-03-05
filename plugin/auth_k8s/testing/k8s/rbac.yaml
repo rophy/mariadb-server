@@ -1,0 +1,21 @@
+---
+# ServiceAccount used by MariaDB server to call the TokenReview API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mariadb-tokenreview
+  namespace: mariadb-auth-test
+---
+# Permission to create TokenReview requests
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mariadb-tokenreview
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: mariadb-tokenreview
+  namespace: mariadb-auth-test
