@@ -46,11 +46,21 @@ TOKEN=$(kubectl create token myapp -n default)
 mysql -u 'default/myapp' -p"$TOKEN" --enable-cleartext-plugin
 ```
 
-## Running Integration Tests
+## Running Tests
 
-The MTR tests require a Kubernetes cluster with test ServiceAccounts.
+There are two MTR test suites:
 
-### Quick start with Kind
+- **`auth_k8s`** — Plugin-only tests (load, sysvars, auth rejection). Always runs.
+- **`auth_k8s_e2e`** — End-to-end tests requiring a real Kubernetes cluster. Skips gracefully if no cluster is available.
+
+### Plugin-only tests (no cluster needed)
+
+```bash
+cd mysql-test
+./mtr --suite=auth_k8s
+```
+
+### End-to-end tests with Kind
 
 ```bash
 # Create Kind cluster with test resources
@@ -61,9 +71,9 @@ mkdir build && cd build
 cmake .. -DPLUGIN_AUTH_K8S=DYNAMIC
 make -j$(nproc)
 
-# Run tests
+# Run all tests
 cd mysql-test
-./mtr --suite=auth_k8s
+./mtr --suite=auth_k8s,auth_k8s_e2e
 ```
 
 ### Using an existing cluster
@@ -76,8 +86,8 @@ kubectl apply -f plugin/auth_k8s/testing/k8s/rbac.yaml
 kubectl apply -f plugin/auth_k8s/testing/k8s/test-clients.yaml
 ```
 
-The MTR suite will auto-detect the cluster via `kubectl` and skip if
-prerequisites are not met.
+The `auth_k8s_e2e` suite will auto-detect the cluster via `kubectl` and
+skip if prerequisites are not met.
 
 ### Cleanup
 
