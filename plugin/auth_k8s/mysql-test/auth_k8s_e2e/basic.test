@@ -7,6 +7,16 @@ SELECT PLUGIN_NAME, PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS
   WHERE PLUGIN_NAME = 'auth_k8s';
 
 #
+# Preparation: Create a temporary pod to obtain a pod-bound SA token.
+# Pod-bound tokens are invalidated when the pod is deleted, which lets us
+# test authentication with a revoked token later (Test 5).
+#
+--exec kubectl run auth-k8s-tmp --image=busybox --restart=Never --overrides='{"spec":{"serviceAccountName":"user1","terminationGracePeriodSeconds":0}}' -n mariadb-auth-test -- sleep 3600 > /dev/null 2>&1
+--exec kubectl wait --for=condition=Ready pod/auth-k8s-tmp -n mariadb-auth-test --timeout=60s > /dev/null 2>&1
+--exec kubectl exec auth-k8s-tmp -n mariadb-auth-test -- cat /var/run/secrets/kubernetes.io/serviceaccount/token > $MYSQLTEST_VARDIR/tmp/pod_bound_token 2>/dev/null
+--exec kubectl delete pod auth-k8s-tmp -n mariadb-auth-test --wait > /dev/null 2>&1
+
+#
 # Test 1: Successful authentication with user1
 #
 CREATE USER 'mariadb-auth-test/user1' IDENTIFIED WITH auth_k8s;
@@ -28,7 +38,25 @@ SELECT USER(), CURRENT_USER();
 --connection default
 
 #
-# Test 2: Authentication failure with wrong user
+# Test 2: Successful authentication with user2
+#
+CREATE USER 'mariadb-auth-test/user2' IDENTIFIED WITH auth_k8s;
+GRANT ALL ON *.* TO 'mariadb-auth-test/user2';
+
+--let $token_cmd= kubectl create token user2 -n mariadb-auth-test --duration=30m 2>/dev/null
+--exec $token_cmd > $MYSQLTEST_VARDIR/tmp/user2_token
+
+--let $user2_token= `SELECT LOAD_FILE('$MYSQLTEST_VARDIR/tmp/user2_token')`
+
+--disable_query_log
+--connect (con_user2, localhost, mariadb-auth-test/user2, $user2_token,,,,auth=mysql_clear_password:mysql_native_password)
+--enable_query_log
+SELECT USER(), CURRENT_USER();
+--disconnect con_user2
+--connection default
+
+#
+# Test 3: Authentication failure with wrong user (user mismatch)
 #
 CREATE USER 'mariadb-auth-test/wronguser' IDENTIFIED WITH auth_k8s;
 
@@ -40,9 +68,37 @@ CREATE USER 'mariadb-auth-test/wronguser' IDENTIFIED WITH auth_k8s;
 --enable_query_log
 
 #
+# Test 4: Valid K8s token but no MariaDB user
+#
+# user2's token is valid in K8s, but 'mariadb-auth-test/nouser' does not exist
+# in MariaDB. The server rejects the connection at MySQL user lookup level.
+--disable_query_log
+--replace_result $MASTER_MYSOCK MASTER_MYSOCK $MASTER_MYPORT MASTER_MYPORT
+--error ER_ACCESS_DENIED_ERROR
+--connect (con_nouser, localhost, mariadb-auth-test/nouser, $user2_token,,,,auth=mysql_clear_password:mysql_native_password)
+--enable_query_log
+
+#
+# Test 5: Pod-bound token revoked after pod deletion
+#
+# The token was extracted from a temporary pod that has been deleted.
+# Kubernetes invalidates pod-bound tokens when the pod is removed,
+# so TokenReview should return authenticated=false.
+--let $pod_token= `SELECT LOAD_FILE('$MYSQLTEST_VARDIR/tmp/pod_bound_token')`
+
+--disable_query_log
+--replace_result $MASTER_MYSOCK MASTER_MYSOCK $MASTER_MYPORT MASTER_MYPORT
+--error ER_ACCESS_DENIED_ERROR
+--connect (con_revoked, localhost, mariadb-auth-test/user1, $pod_token,,,,auth=mysql_clear_password:mysql_native_password)
+--enable_query_log
+
+#
 # Cleanup
 #
 --connection default
 DROP USER 'mariadb-auth-test/user1';
+DROP USER 'mariadb-auth-test/user2';
 DROP USER 'mariadb-auth-test/wronguser';
 --remove_file $MYSQLTEST_VARDIR/tmp/user1_token
+--remove_file $MYSQLTEST_VARDIR/tmp/user2_token
+--remove_file $MYSQLTEST_VARDIR/tmp/pod_bound_token
