@@ -1,0 +1,8 @@
+SELECT VARIABLE_VALUE FROM INFORMATION_SCHEMA.GLOBAL_VARIABLES
+WHERE VARIABLE_NAME = 'auth_k8s_api_url';
+VARIABLE_VALUE
+https://192.0.2.1:6443
+CREATE USER 'test/user1' IDENTIFIED WITH auth_k8s;
+ERROR 28000: Access denied for user 'test/user1'@'localhost' (using password: YES)
+connection default;
+DROP USER 'test/user1';

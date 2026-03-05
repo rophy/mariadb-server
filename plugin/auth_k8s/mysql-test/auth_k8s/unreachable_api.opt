@@ -1,0 +1,2 @@
+--loose-auth-k8s-api-url=https://192.0.2.1:6443
+--loose-auth-k8s-timeout=2

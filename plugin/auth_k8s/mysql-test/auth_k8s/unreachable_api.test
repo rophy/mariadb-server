@@ -1,0 +1,25 @@
+--source include/not_embedded.inc
+
+#
+# Verify the plugin is configured to point at a non-routable API server
+# (192.0.2.1 is TEST-NET-1, RFC 5737 — guaranteed unreachable)
+#
+SELECT VARIABLE_VALUE FROM INFORMATION_SCHEMA.GLOBAL_VARIABLES
+  WHERE VARIABLE_NAME = 'auth_k8s_api_url';
+
+#
+# Test: Connection attempt times out / is refused when API server is unreachable
+#
+CREATE USER 'test/user1' IDENTIFIED WITH auth_k8s;
+
+--disable_query_log
+--replace_result $MASTER_MYSOCK MASTER_MYSOCK $MASTER_MYPORT MASTER_MYPORT
+--error ER_ACCESS_DENIED_ERROR
+--connect (con_timeout, localhost, test/user1, some-token-value,,,,auth=mysql_clear_password:mysql_native_password)
+--enable_query_log
+
+#
+# Cleanup
+#
+--connection default
+DROP USER 'test/user1';
